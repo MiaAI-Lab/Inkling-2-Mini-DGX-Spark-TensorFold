@@ -39,9 +39,6 @@ MTP_SHA256="${MTP_SHA256:-7c3b651317f01f73bcf4e1dceba66ef8b7e1a1eac6bc171e882e69
 MODEL_MOUNT=/models/ink
 QUANT_LABEL="ModelOpt NVFP4 experts, MXFP8 layers 20-23, bf16 MTP"
 CKPT_GIB=20
-# What loading takes of MemAvailable: the engine reported "model 22.82 GiB" with no drafter (2026-11-22). The DSpark
-# drafter adds its 0.6 GiB of weights, a 0.1 GiB folded head and its scratch; the vision tower (VISION=1) 0.6 GiB. PROVISIONAL.
-WEIGHTS_GIB="${WEIGHTS_GIB:-25}"
 
 # The engine: TensorFold's Zig engine at Jürgen Schmied's Inkling 2 Mini CUDA head (TensorFold PR #4441, "C4"),
 # plus this recipe's patches/*.patch. The commit is reachable as refs/pull/4441/head on ashhart/TensorFold and as
@@ -78,8 +75,27 @@ CONTEXT="${CONTEXT:-262144}"
 # KV_DTYPE=bf16 PARALLEL=4 serves that; fp8 is this deployment's choice.)
 PARALLEL="${PARALLEL:-8}"
 MAX_TOKENS="${MAX_TOKENS:-32768}"
-# DRAFTS=1 loads the checkpoint's own DSpark drafter (mtp.safetensors) with --drafter; 0 passes --no-drafts.
+# DRAFTS=1 drafts with DRAFTER; 0 passes --no-drafts.
 DRAFTS="${DRAFTS:-1}"
+# DRAFTER=dflash2 (default): incoai/Inkling-2-Mini-DFlash2 (Apache-2.0), a block-diffusion draft model at a pinned
+# revision, fetched into DRAFTER_DIR by scripts/fetch.sh and SHA-256 checked, mounted read-only at /models/draft.
+# DRAFTER=dspark: the checkpoint's own DSpark head (mtp.safetensors), as before.
+DRAFTER="${DRAFTER:-dflash2}"
+[[ "$DRAFTER" =~ ^(dflash2|dspark)$ ]] || { echo "DRAFTER is dflash2 or dspark, not $DRAFTER" >&2; exit 1; }
+DRAFTER_DIR="${DRAFTER_DIR:-$HOME/models/hf/Inkling-2-Mini-DFlash2}"
+DRAFTER_REPO="${DRAFTER_REPO:-incoai/Inkling-2-Mini-DFlash2}"
+DRAFTER_REV="${DRAFTER_REV:-4f9088ea66c21f2b99ed657d1941c306b03e84d2}"
+DRAFTER_NAME="model.safetensors"
+DRAFTER_SHA256="${DRAFTER_SHA256:-217980ab00d116693fa5946df7bbfd967caf5fac1f529afd541fbd470ddb54ee}"
+DRAFTER_MOUNT=/models/draft
+DRAFTER_FETCH="${DRAFTER_FETCH:-1}"   # scripts/prepare.sh runs scripts/fetch.sh drafter when the folder is incomplete
+DFLASH2=0; [[ "$DRAFTS" == 1 && "$DRAFTER" == dflash2 ]] && DFLASH2=1
+# What loading takes of MemAvailable: the engine reported "model 22.82 GiB" with no drafter (2026-11-22). The DSpark
+# drafter adds its 0.6 GiB of weights, a 0.1 GiB folded head and its scratch; DFlash2 1.67 GiB (FP8 layers, an NVFP4 target
+# head copy, the selector's codebooks and scratch; "model 26.18 GiB" with 4 streams of 32k and an FP8 head, 2026-11-24); the
+# vision tower (VISION=1) 0.6 GiB. PROVISIONAL.
+if [[ "$DFLASH2" == 1 ]]; then WEIGHTS_GIB="${WEIGHTS_GIB:-27}"; else WEIGHTS_GIB="${WEIGHTS_GIB:-25}"; fi
+drafts_label() { if [[ "$DRAFTS" != 1 ]]; then echo off; elif [[ "$DRAFTER" == dflash2 ]]; then echo DFlash2; else echo DSpark; fi; }
 # VISION=1 loads the checkpoint's inkling2_vision tower (--vision, ~0.6 GiB of bf16 weights) for image inputs (PNG,
 # JPEG, WebP). VISION_URLS=1 also lets image_url fetch http(s) URLs (data: URLs always work). VISION_MAX_IMAGES and
 # VISION_IMAGE_TOKENS (an image's token budget, engine default 4096) are passed when set.
@@ -116,12 +132,13 @@ if [[ "$RERISKED" == 1 ]]; then export TF_REASONING_FIELD="${TF_REASONING_FIELD:
 # One stream's cache at a CONTEXT-token window. Per token: the 8 full visits' K and V (bf16: 8 x 1024 x 2 x 2 = 32,768 bytes;
 # fp8: 8 x 2 x (1024 + 8 scales x 4) = 16,896 bytes); the 40 sliding visits keep fixed 1,536-row rings and 48 visits keep conv
 # states (~0.24 GiB together a stream). The engine reported 1.24 GiB a stream at 32,768 tokens, which this reproduces.
-# The drafter's global layer adds 4,096 bytes a token. PROVISIONAL.
+# The DSpark head's global layer adds 4,096 bytes a token; DFlash2 a fixed 40 MiB ring a stream (5 layers' K and V over
+# its 2,048-position window), inside the rounding. PROVISIONAL.
 kv_gib() {
   local ctx=${1:-$CONTEXT} per=32768
   [[ "$KV_DTYPE" == fp8 ]] && per=16896
   [[ "$ctx" =~ ^[0-9]+$ ]] || ctx=$CONTEXT
-  [[ "$DRAFTS" == 1 ]] && per=$((per + 4096))
+  [[ "$DRAFTS" == 1 && "$DRAFTER" == dspark ]] && per=$((per + 4096))
   echo $(( (per * ctx + 268435456 + 1073741823) / 1073741824 ))
 }
 # MemAvailable a start needs: weights, every stream's window, scratch slack and the floor. PROVISIONAL.
@@ -144,10 +161,12 @@ log()  { printf '%s[%s]%s %s\n' "$(_c 1 '1;36')" "$(basename "$0")" "$(_c 1 0)" 
 warn() { printf '%s[%s] WARN:%s %s\n' "$(_c 2 '1;33')" "$(basename "$0")" "$(_c 2 0)" "$*" >&2; }
 die()  { printf '%s[%s] ERROR:%s %s\n' "$(_c 2 '1;31')" "$(basename "$0")" "$(_c 2 0)" "$*" >&2; exit 1; }
 
-# size and mtime of the two weight files: a change makes prepare.sh hash them again
+# size and mtime of the weight files (and the DFlash2 draft's): a change makes prepare.sh hash them again
 weights_stamp() {
   local f out=""
-  for f in "$MODEL_DIR/$SHARD_NAME" "$MODEL_DIR/$MTP_NAME"; do
+  local -a files=("$MODEL_DIR/$SHARD_NAME" "$MODEL_DIR/$MTP_NAME")
+  [[ "$DFLASH2" == 1 ]] && files+=("$DRAFTER_DIR/$DRAFTER_NAME")
+  for f in "${files[@]}"; do
     out+="$(stat -c '%s %Y' "$f" 2>/dev/null || echo missing) "
   done
   echo "$out"

@@ -14,7 +14,7 @@
 Serve **[Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)** on a single **NVIDIA DGX Spark** (GB10, `sm_121`, 128 GB
 unified memory) through an OpenAI-compatible API (plus a `/v1/messages` Messages-format endpoint). It runs [TensorFold](https://github.com/ashhart/TensorFold)'s Zig engine
 (`tensorfold-native`, Jürgen Schmied's Inkling 2 Mini CUDA engine at [PR #4441](https://github.com/ashhart/TensorFold/pull/4441), commit
-`dc2ca8a1`) plus `patches/0001`–`0017` in NVIDIA's PyTorch container. It has native CUDA vision (`inkling2_vision`: PNG, JPEG, WebP) and
+`dc2ca8a1`) plus `patches/0001`–`0018` in NVIDIA's PyTorch container. It has native CUDA vision (`inkling2_vision`: PNG, JPEG, WebP) and
 structured output and tool calling (`libtfgrammar.so`).
 
 - **Model:** a looped mixture of experts.
@@ -24,7 +24,14 @@ structured output and tool calling (`libtfgrammar.so`).
   - Attention: 40 visits use a 1,024-token sliding window, 8 attend the whole context.
   - Vision: a 23-layer `inkling2_vision` ViT encoder (0.59 GiB bf16).
   - Checkpoint: NVIDIA ModelOpt, with NVFP4 experts (layers 0–19) and MXFP8 (20–23). Its bf16 MTP module (`mtp.safetensors`) is the DSpark
-    drafter.
+    drafter (`DRAFTER=dspark`).
+- **Default drafter:** [`incoai/Inkling-2-Mini-DFlash2`](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2), a DFlash 2 block-diffusion
+  draft model (5 layers, 0.49B parameters, Apache-2.0).
+  - Pinned at revision `4f9088ea`, downloaded into `$HOME/models/hf/Inkling-2-Mini-DFlash2` by `scripts/fetch.sh drafter` (~1 GB), then
+    SHA-256 verified.
+  - One pass drafts a block of 7 tokens. It reads the target's visits 5, 23, 41 and the final norm, keeps each position's 16 best tokens from
+    the target's head, and its candidate selector picks one path. Sampled requests pick with the target sampler's own keyed noise.
+  - Patch `0018` runs it natively in the engine (`--drafter /models/draft`). The target verifies every draft, so replies are unchanged.
 - **Default checkpoint:** upstream `thinkingmachines/Inkling-2-Mini`.
   - Pinned at revision `7a67ae23` and downloaded into `$HOME/models/hf/Inkling-2-Mini` by `scripts/fetch.sh`, then SHA-256 verified.
   - `RERISKED=1` serves a local [`Inkling-2-Mini-Derisked`](https://huggingface.co/Blackfrost-AI/Inkling-2-Mini-Derisked) folder instead. It is
@@ -35,17 +42,40 @@ structured output and tool calling (`libtfgrammar.so`).
     the readiness gate.
 - **Default serving config:**
   - **262,144** tokens a stream (the model's limit is 1,048,576) and **8** concurrent streams.
-  - `fp8` KV cache, the DSpark drafter (`DRAFTS=1`) and native CUDA vision (`VISION=1`).
+  - `fp8` KV cache, the DFlash2 drafter (`DRAFTS=1`, `DRAFTER=dflash2`) and native CUDA vision (`VISION=1`).
   - Structured output and `tool_choice`.
   - FP8 attention projections (`TF_INKLING2_ATTN_FP8=1`) and Blackwell native FP4/MXFP8 prefill tensor cores (`TF_INKLING2_PREFILL_TC=1`).
 - **One command:** `./start.sh` downloads the weights, builds the `sm_121` image on the first run and starts the server; `./stop.sh` stops it.
 
 ## Performance
 
-Measured with [sparkDash](https://github.com/MiaAI-Lab/sparkDash/) on one **NVIDIA DGX Spark** (GB10, `sm_121`). Settings: `Inkling-2-Mini`,
-`CONTEXT=262144`, `PARALLEL=8`, `KV_DTYPE=fp8`, `DRAFTS=1` (DSpark), `TF_INKLING2_ATTN_FP8=1`, `TF_INKLING2_PREFILL_TC=1`.
+### DFlash2 vs DSpark decode
 
-### Prefill
+Same engine build (patches `0001`–`0018`) and server settings on one DGX Spark, only `--drafter` changed: `Inkling-2-Mini-Derisked`,
+`CONTEXT=262144`, `PARALLEL=8`, `KV_DTYPE=fp8`, `TF_INKLING2_ATTN_FP8=1`, `TF_INKLING2_PREFILL_TC=1`, thinking on. Requests: `temperature 0.7`,
+`top_k 20`, 512 tokens, eight different prompts. Aggregate decode tok/s (sum of the streams' decode rates), median of 2 runs.
+
+| Streams | Prose DSpark | Prose **DFlash2** | Code DSpark | Code **DFlash2** |
+| --- | ---: | ---: | ---: | ---: |
+| ×1 | 46.3 | **52.1** (+13%) | 54.4 | **74.3** (+37%) |
+| ×2 | 68.0 | **84.6** (+24%) | 63.4 | **111.1** (+75%) |
+| ×4 | 96.6 | **115.6** (+20%) | 129.2 | **159.2** (+23%) |
+| ×8 | 136.5 | **168.1** (+23%) | 190.0 | **237.5** (+25%) |
+
+- **Tokens a round** at ×1–×8 (the drafter before its NVFP4 head and chances): **2.48** for DFlash2 (59.7% of drafts accepted), 1.75 for DSpark
+  (51.7%).
+- **Greedy, thinking off** (`temperature 0`, 1,024 tokens), the same harness: one stream does 106.7 tok/s on code and 65.1 on prose, two
+  streams 154.0 and 97.6, six streams 243.3 and 163.3.
+- **The NVFP4 head and calibrated chances** (after [tonyd2wild](https://github.com/tonyd2wild)'s patch, see Credits) add +33% (code) and +18% (prose) for one greedy stream and +20%
+  (code) for one stream at `temperature 0.7`. With two streams or more they change nothing; that's where the chances switch off.
+
+### sparkDash (DSpark)
+
+Measured with [sparkDash](https://github.com/MiaAI-Lab/sparkDash/) before DFlash2, on one **NVIDIA DGX Spark** (GB10, `sm_121`). Settings:
+`Inkling-2-Mini`, `CONTEXT=262144`, `PARALLEL=8`, `KV_DTYPE=fp8`, `DRAFTS=1` (DSpark), `TF_INKLING2_ATTN_FP8=1`, `TF_INKLING2_PREFILL_TC=1`.
+Prefill doesn't depend on the drafter.
+
+#### Prefill
 
 | Context | tok/s | TTFT | Prompt tokens |
 | --- | ---: | ---: | ---: |
@@ -56,7 +86,7 @@ Measured with [sparkDash](https://github.com/MiaAI-Lab/sparkDash/) on one **NVID
 | 64k | **2,749.6 tok/s** | 24.01 s | 65,573 |
 | 128k | **2,267.3 tok/s** | 57.99 s | 131,106 |
 
-### Decode (`temp 0.7` · thinking on · `top_k 20` · DSpark drafts)
+#### Decode (`temp 0.7` · thinking on · `top_k 20` · DSpark drafts)
 
 | Streams | Prose agg | Prose / stream | Prose TTFT | Code agg | Code / stream | Code TTFT |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -67,7 +97,21 @@ Measured with [sparkDash](https://github.com/MiaAI-Lab/sparkDash/) on one **NVID
 
 ## Checks
 
-All of these passed with the defaults (`CONTEXT=262144`, `PARALLEL=8`, `KV_DTYPE=fp8`, `DRAFTS=1`, `VISION=1`), patches 0001–0017:
+**DFlash2 (patches `0001`–`0018`, `DRAFTER=dflash2`)**, with the defaults (`CONTEXT=262144`, `PARALLEL=8`, `KV_DTYPE=fp8`, `DRAFTS=1`). The image
+`./start.sh` built served the live checks:
+
+- **`tools/exact.py`**: **PASS** at pads 0, 3k and 24k (551–594 drafts accepted). Serial drafted, `"draft": false` and 6-way concurrent replies
+  match on every prompt. The live image repeated it at 3k.
+- **`tools/prompt_reuse.py`** (30k, 4 follow-up turns, another conversation in between): **PASS**. Each follow-up reused 99.4%–99.5% of its
+  prompt, with a 0.22 s warm prefill.
+- **200k-token needle** (199,951 prompt tokens, `max_tokens=512`): **PASS** at 10% and 90% depth (`warm-library-4557`). These ran with the
+  prompt resumed from the cache, which drafts from a context that starts mid-prompt.
+- **Structured output and `tool_choice`** (live image): **PASS**, 10/10. Covers `json_schema` (greedy, sampled, thinking off), `json_object`,
+  `required`, a named function, `auto`, `guided_regex` and `guided_choice`.
+- **Vision** (live image, `VISION=1`): **PASS**. Three PNGs drafted equal `"draft": false`, and 4 requests at once equal serial ones.
+- Startup smoke test and the Derisked readiness check: **PASS**.
+
+**DSpark (patches `0001`–`0017`)**, the same defaults:
 
 - **`tools/exact.py`** (pads 0, 3k and 24k): **PASS**. Every prompt matches across serial drafted, `"draft": false` and 6-way concurrent replies
   (494–503 drafts accepted).
@@ -93,7 +137,7 @@ All of these passed with the defaults (`CONTEXT=262144`, `PARALLEL=8`, `KV_DTYPE
   - Loading takes about 25 GiB, and each stream holds its whole window from the start.
   - `start.sh` stops before launching when `MemAvailable` is below what the settings need (`MEM_NEED_GIB`; `MEM_CHECK=0` starts anyway).
 - Docker with the NVIDIA Container Toolkit, and your user in the `docker` group.
-- ~40 GB free under Docker's root for the image, plus ~20 GB for the checkpoint.
+- ~40 GB free under Docker's root for the image, plus ~20 GB for the checkpoint and ~1 GB for the DFlash2 draft model.
 
 ## Quick start
 
@@ -104,9 +148,9 @@ cd Inkling-2-Mini-DGX-Spark-TensorFold
 ```
 
 On the first run, `./start.sh` does five things:
-1. Downloads `thinkingmachines/Inkling-2-Mini` (~18.8 GB, resumable).
+1. Downloads `thinkingmachines/Inkling-2-Mini` (~18.8 GB) and `incoai/Inkling-2-Mini-DFlash2` (~1 GB), both resumable.
 2. Builds `tensorfold-inkling2:c4-dc2ca8a`, with the kernels embedded in the binary for `sm_121`.
-3. Verifies the checkpoint's SHA-256 once.
+3. Verifies the checkpoint's and the draft model's SHA-256 once.
 4. Launches the server on port `8888`.
 5. Runs a smoke test.
 
@@ -140,11 +184,15 @@ curl -s http://<spark-address>:8888/health
 On a 128 GB DGX Spark with the defaults (`CONTEXT=262144`, `PARALLEL=8`, `KV_DTYPE=fp8`, `DRAFTS=1`, `VISION=1`,
 `TENSORFOLD_MEMORY_RESERVE_GIB=9`):
 
-- **Weights:** ~19.7 GiB (`17.60 GiB` target + `1.54 GiB` DSpark + `0.59 GiB` vision), plus scratch.
-- **Active KV slots:** **44.5 GiB** (`5.56 GiB` a stream × 8 streams = **2,097,152 active tokens**; `fp8` target KV, `bf16` DSpark KV).
-- **Prompt cache pool:** whatever is left after a `9.0 GiB` reserve. That's **16.0 GiB** on an otherwise idle Spark, less when other
+- **Weights:** ~19.9 GiB (`17.60 GiB` target + `1.67 GiB` DFlash2 + `0.59 GiB` vision), plus scratch. DFlash2's share holds its layers as
+  FP8 copies, the target head as an NVFP4 copy, the selector's codebooks and its scratch.
+- **Active KV slots:** **36.7 GiB** (`4.59 GiB` a stream × 8 streams = **2,097,152 active tokens**). That's the `fp8` target KV plus DFlash2's
+  fixed 40 MiB ring a stream: 5 layers' bf16 K/V over its 2,048-position window.
+- **Prompt cache pool:** whatever is left after a `9.0 GiB` reserve. That's **18.5 GiB** on an otherwise idle Spark, less when other
   containers share the memory.
-- **Engine total:** ~59.7 GiB plus the prompt cache.
+- **Engine total:** ~59.8 GiB (`model 59.83 GiB` in the log) plus the prompt cache.
+- **`DRAFTER=dspark`:** `1.54 GiB` of drafter weights and `5.56 GiB` a stream, because DSpark's global layer keeps a bf16 K/V row for every
+  position in the window. That leaves a 16.0 GiB prompt cache.
 
 Every stream reserves its full `CONTEXT` window at startup. For exact serving:
 - `KV_DTYPE=bf16` (with, say, `PARALLEL=4`) for bf16 KV caches;
@@ -163,7 +211,9 @@ All defaults live in [`scripts/config.sh`](scripts/config.sh). Override them fro
 | `PARALLEL` | `8` | concurrent request slots (each gets a full `CONTEXT` window) |
 | `CONTEXT` | `262144` | prompt + reply window a stream (up to `1048576`) |
 | `KV_DTYPE` | `fp8` | target KV cache: `fp8` or `bf16` (exact) |
-| `DRAFTS` | `1` | `1`: DSpark drafter (`--drafter /models/ink`); `0`: `--no-drafts` |
+| `DRAFTS` | `1` | `1`: draft with `DRAFTER`; `0`: `--no-drafts` |
+| `DRAFTER` | `dflash2` | `dflash2`: the DFlash2 draft model (`--drafter /models/draft`); `dspark`: the checkpoint's DSpark head (`--drafter /models/ink`) |
+| `DRAFTER_DIR` | `$HOME/models/hf/Inkling-2-Mini-DFlash2` | DFlash2 folder (auto-fetched), mounted read-only at `/models/draft` |
 | `VISION` | `1` | `1`: Inkling 2 vision tower (`--vision`, ~0.59 GiB, PNG/JPEG/WebP); `0`: text only |
 | `VISION_URLS` | `0` | `1`: also fetch http(s) image URLs (`--vision-urls`); `data:` URLs always work |
 | `VISION_MAX_IMAGES` / `VISION_IMAGE_TOKENS` | unset | images a request (engine default 4, up to 100) and an image's token budget (default 4,096) |
@@ -192,7 +242,7 @@ All defaults live in [`scripts/config.sh`](scripts/config.sh). Override them fro
 - **Exact serial reference:** `"draft": false` on any request turns drafting off. Drafted replies match `"draft": false` token for token.
 - **Admission:** when all `PARALLEL` slots are full, new requests are rejected rather than queued.
 
-## Patches (`patches/0001`–`0017`)
+## Patches (`patches/0001`–`0018`)
 
 Applied in order onto TensorFold `dc2ca8a1` (PR #4441) by `scripts/prepare.sh`:
 
@@ -206,6 +256,7 @@ Applied in order onto TensorFold `dc2ca8a1` (PR #4441) by `scripts/prepare.sh`:
 | `0015` | Blackwell native block-scaled tensor-core prefill experts (`sm_121a`, `TF_INKLING2_PREFILL_TC=1`): prompt activations quantized once a layer (38 MiB of scratch), then `kind::mxf4nvf4` (layers 0–19) and `kind::mxf8f6f4` (20–23) run directly over TensorFold's packed weights |
 | `0016` | Native CUDA vision encoder (`inkling2_vision`): `Inkling2ImageProcessor` (PNG/JPEG/WebP, EXIF orientation, 8×8 checkerboard alpha, `-1.0` padding to 40×40 tiles), the 23-layer ViT with 2D pairwise axial RoPE, LayerScale and bilinear position embeddings, `vision_kernel<64, 8>` tensor-core attention, the 2×2 spatial merge and GELU projector, and image embeddings spliced into the prompt (`--vision`) |
 | `0017` | Server fixes: the reply grammar is freed when a stream fails to start (`lane_stream.zig`); opt-in `TF_TOOL_CALL_GUARD=1` and rejected tool-envelope logs (`TF_TOOL_CALL_DEBUG=1`); `--vision-max-images` up to 100; `--dashboard-open` |
+| `0018` | DFlash2 drafter (`mini_dflash.zig`, `inkling2/dflash.cu`): `--drafter` on a DFlash2 folder loads it in place of DSpark. Committed taps go through `fc` and the hidden norm into 5 layers' 2,048-position K/V rings; one pass embeds the pending token and 7 masks and runs the two-tap dynamic convs, non-causal block attention and SwiGLU (layers as FP8 copies); an NVFP4 copy of the target head gives each row's top 16, and a GPU candidate selector walks the path (keyed draws for sampled requests). A stream alone gives the round planner each draft's chance, the selector's probability calibrated by what landed. After TensorFold's GLM-5.3-Flash CUDA DFlash2 and [tonyd2wild](https://github.com/tonyd2wild)'s [Inkling DFlash2 patch](https://github.com/tonyd2wild/Inkling-2-Mini-NVFP4-DGX-Spark) |
 
 ## Tools
 
@@ -225,7 +276,7 @@ Applied in order onto TensorFold `dc2ca8a1` (PR #4441) by `scripts/prepare.sh`:
 start.sh      set up (first run) and start the server
 stop.sh       stop it
 scripts/      config.sh, prepare.sh, fetch.sh, banner.sh
-patches/      0001–0017 applied onto TensorFold at TF_REF
+patches/      0001–0018 applied onto TensorFold at TF_REF
 tools/        verification scripts
 CREDITS.md    upstream credits
 NOTICE        third-party notices
@@ -246,9 +297,9 @@ libjpeg-turbo and libwebp, which it builds.
 
 ## Credits
 
-- **Recipe & patches (`0001`–`0003`, `0005`–`0017`):** created and built by **[MiaAI-Lab](https://github.com/MiaAI-Lab)** (Mia's AI Lab). That
+- **Recipe & patches (`0001`–`0003`, `0005`–`0018`):** created and built by **[MiaAI-Lab](https://github.com/MiaAI-Lab)** (Mia's AI Lab). That
   includes:
-  - CUDA DSpark drafting, `--kv-cache fp8`, and decode and prefill kernel optimizations;
+  - CUDA DSpark and DFlash2 drafting, `--kv-cache fp8`, and decode and prefill kernel optimizations;
   - 4,096-row passes, wide verify CUDA graphs, and Blackwell native FP4/MXFP8 prefill tensor cores;
   - structured output and `tool_choice`, and native CUDA `inkling2_vision` image support;
   - full TensorFold serving support for `Inkling-2-Mini-Derisked`, whose upstream
@@ -266,6 +317,9 @@ libjpeg-turbo and libwebp, which it builds.
     [akol1](https://github.com/akol1).
 - **Blackwell prefill & chunking ideas:** [Basalt](https://github.com/jesdga95/basalt) by [jesdga95](https://github.com/jesdga95).
 - **Reply-grammar leak fix (`0017`):** SvangenStudios' PR #28.
+- **DFlash2 drafter (`0018`):** [tonyd2wild](https://github.com/tonyd2wild)'s independent Inkling 2 Mini DFlash2 patch
+  ([Inkling-2-Mini-NVFP4-DGX-Spark](https://github.com/tonyd2wild/Inkling-2-Mini-NVFP4-DGX-Spark), Apache-2.0): the NVFP4 draft-head copy and
+  the lone-stream draft chances calibrated by what landed.
 - **Model & derivative:** [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) by Thinking Machines;
   `Inkling-2-Mini-Derisked` by Blackfrost.
 - **Runtime dependencies:** [xgrammar](https://github.com/mlc-ai/xgrammar) (`libtfgrammar.so`, Apache-2.0),
