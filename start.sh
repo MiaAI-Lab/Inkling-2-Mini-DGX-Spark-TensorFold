@@ -110,6 +110,9 @@ if (( ! DRY )) && [[ "$MODE" == start ]] && running; then
 fi
 
 step 1 "Setup: image and checkpoint"
+if [[ "$DRAFT_LABEL" == DFlash2 && "${PREPARE:-auto}" != 0 && ( ! -s "$DFLASH2_DIR/config.json" || ! -s "$DFLASH2_DIR/model.safetensors" ) ]]; then
+  if (( DRY )); then log "DRY_RUN: scripts/fetch_dflash2.sh would run now"; else ./scripts/fetch_dflash2.sh; fi
+fi
 if [[ "${PREPARE:-auto}" == 1 || ( "${PREPARE:-auto}" != 0 && "$(prepared_state 2>/dev/null)" != "$(cat "$PREPARED_MARKER" 2>/dev/null)" ) ]]; then
   if (( DRY )); then log "DRY_RUN: scripts/prepare.sh would run now"
   else
@@ -133,9 +136,9 @@ KCACHE=$(docker image inspect -f '{{index .Config.Labels "tf.patches"}}' "$IMAGE
 [[ -f "$MODEL_DIR/config.json" && -f "$MODEL_DIR/$MTP_NAME" ]] || missing "$MODEL_DIR holds no Inkling-2-Mini checkpoint (config.json, $MTP_NAME): set MODEL_DIR"
 if [[ "$DRAFT_LABEL" == DFlash2 ]]; then
   if [[ ! -f "$DFLASH2_DIR/config.json" || ! -f "$DFLASH2_DIR/model.safetensors" ]]; then
-    missing "$DFLASH2_DIR holds no DFlash2 drafter (config.json, model.safetensors): set DFLASH2_DIR, or see DRAFTER in scripts/config.sh"
+    missing "$DFLASH2_DIR holds no DFlash2 drafter (config.json, model.safetensors): scripts/fetch_dflash2.sh downloads it"
   elif [[ "$(sha256sum "$DFLASH2_DIR/model.safetensors" | cut -d' ' -f1)" != "$DFLASH2_SHA256" ]]; then
-    missing "$DFLASH2_DIR/model.safetensors is not the pinned DFlash2 drafter (SHA-256 $DFLASH2_SHA256)"
+    missing "$DFLASH2_DIR/model.safetensors is not the pinned DFlash2 drafter (SHA-256 $DFLASH2_SHA256): delete it to download it again"
   fi
 fi
 

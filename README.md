@@ -165,7 +165,7 @@ All defaults live in [`scripts/config.sh`](scripts/config.sh). Override them fro
 | `KV_DTYPE` | `fp8` | target KV cache: `fp8` or `bf16` (exact) |
 | `DRAFTS` | `1` | `1`: DSpark drafter (`--drafter /models/ink`); `0`: `--no-drafts` |
 | `DRAFTER` | `dspark` | `dflash2`: draft with [`incoai/Inkling-2-Mini-DFlash2`](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2) from `DFLASH2_DIR` (see [DFlash2](#dflash2-drafter)) |
-| `DFLASH2_DIR` | `$HOME/models/hf/Inkling-2-Mini-DFlash2` | the DFlash2 drafter's folder, mounted read-only and checked by SHA-256 |
+| `DFLASH2_DIR` | `$HOME/models/hf/Inkling-2-Mini-DFlash2` | the DFlash2 drafter's folder: downloaded when missing, checked by SHA-256, mounted read-only |
 | `VISION` | `1` | `1`: Inkling 2 vision tower (`--vision`, ~0.59 GiB, PNG/JPEG/WebP); `0`: text only |
 | `VISION_URLS` | `0` | `1`: also fetch http(s) image URLs (`--vision-urls`); `data:` URLs always work |
 | `VISION_MAX_IMAGES` / `VISION_IMAGE_TOKENS` | unset | images a request (engine default 4, up to 100) and an image's token budget (default 4,096) |
@@ -200,9 +200,7 @@ All defaults live in [`scripts/config.sh`](scripts/config.sh). Override them fro
 instead of DSpark. Replies stay the target's: drafted output equals `"draft": false` token for token.
 
 ```bash
-hf download incoai/Inkling-2-Mini-DFlash2 config.json model.safetensors \
-  --revision 4f9088ea66c21f2b99ed657d1941c306b03e84d2 --local-dir ~/models/hf/Inkling-2-Mini-DFlash2
-DRAFTER=dflash2 ./start.sh restart
+DRAFTER=dflash2 ./start.sh restart   # downloads the drafter first when it is missing (~1 GB, resumable)
 ```
 
 Decode on one DGX Spark with the GPU clock capped at 1,600 MHz (`CONTEXT=262144`, `PARALLEL=4`, fp8 KV, 10 prompts of up to
@@ -219,7 +217,7 @@ Decode on one DGX Spark with the GPU clock capped at 1,600 MHz (`CONTEXT=262144`
 | ×4 temp 1 | 87.4 | **101.5** | 1.16x |
 | ×4 temp 1, thinking | 88.7 | **101.0** | 1.14x |
 
-Prefill is unchanged (8k: 2,761 vs 2,767 tok/s). Memory: 1.12 GiB plus 0.04 GiB a stream (DSpark: 1.54 GiB plus 1.01 GiB a stream
+Prefill is unchanged (8k: 2,761 vs 2,766 tok/s). Memory: 1.12 GiB plus 0.04 GiB a stream (DSpark: 1.54 GiB plus 1.01 GiB a stream
 at 262,144 tokens). With the whole block drafted every round it accepts what vLLM's DFlash2 does on the same prompts (3.0–3.5
 tokens a round); `tools/exact.py` passes at pads 0, 3k and 24k.
 

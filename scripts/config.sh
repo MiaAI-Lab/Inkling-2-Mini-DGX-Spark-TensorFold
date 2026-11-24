@@ -80,11 +80,14 @@ PARALLEL="${PARALLEL:-8}"
 MAX_TOKENS="${MAX_TOKENS:-32768}"
 # DRAFTS=1 loads the checkpoint's own DSpark drafter (mtp.safetensors) with --drafter; 0 passes --no-drafts.
 DRAFTS="${DRAFTS:-1}"
-# DRAFTER=dflash2 drafts with incoai/Inkling-2-Mini-DFlash2 (patch 0018) from DFLASH2_DIR instead of DSpark:
-#   hf download incoai/Inkling-2-Mini-DFlash2 config.json model.safetensors --revision 4f9088ea66c21f2b99ed657d1941c306b03e84d2
+# DRAFTER=dflash2 drafts with incoai/Inkling-2-Mini-DFlash2 (patch 0018) from DFLASH2_DIR instead of DSpark.
+# start.sh fetches it there when it is missing (scripts/fetch_dflash2.sh, ~1 GB).
 DRAFTER="${DRAFTER:-dspark}"
 DFLASH2_DIR="${DFLASH2_DIR:-$HOME/models/hf/Inkling-2-Mini-DFlash2}"
 DFLASH2_MOUNT=/models/dflash2
+DFLASH2_REPO=incoai/Inkling-2-Mini-DFlash2
+DFLASH2_REVISION=4f9088ea66c21f2b99ed657d1941c306b03e84d2
+DFLASH2_CONFIG_SHA256=d094e435eb939e01fca6297f637c5af35e3da4b552f8e1ab0a181cd278a1cefa
 DFLASH2_SHA256="${DFLASH2_SHA256:-217980ab00d116693fa5946df7bbfd967caf5fac1f529afd541fbd470ddb54ee}"
 # VISION=1 loads the checkpoint's inkling2_vision tower (--vision, ~0.6 GiB of bf16 weights) for image inputs (PNG,
 # JPEG, WebP). VISION_URLS=1 also lets image_url fetch http(s) URLs (data: URLs always work). VISION_MAX_IMAGES and
