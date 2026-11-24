@@ -1,7 +1,7 @@
 # Credits
 
-This repository is a thin layer of scripts. Almost everything that makes it work was built by others. Its own work is licensed under the MIT
-License ([`LICENSE`](LICENSE)). The image `scripts/prepare.sh` builds also carries TensorFold's license files from the pinned checkout.
+This repository is a thin layer of scripts. Almost everything that makes it work was built by others. Its own work is licensed under the Apache
+License, Version 2.0 ([`LICENSE`](LICENSE)). The image `scripts/prepare.sh` builds also carries TensorFold's license files from the pinned checkout.
 
 ## Model
 

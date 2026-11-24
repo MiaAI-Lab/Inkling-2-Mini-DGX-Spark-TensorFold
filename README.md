@@ -233,7 +233,7 @@ NOTICE        third-party notices
 
 ## License
 
-MIT, see [`LICENSE`](LICENSE). Model weights are not part of this repository: `thinkingmachines/Inkling-2-Mini` is Apache-2.0 with Thinking
+Apache-2.0, see [`LICENSE`](LICENSE). Model weights are not part of this repository: `thinkingmachines/Inkling-2-Mini` is Apache-2.0 with Thinking
 Machines' [Model Acceptable Use Policy](https://thinkingmachines.ai/model-acceptable-use-policy/), and `Inkling-2-Mini-Derisked` is subject to
 the upstream terms and notices.
 
@@ -241,7 +241,7 @@ the upstream terms and notices.
 (`nvcr.io/nvidia/pytorch:26.07-py3`). The NVIDIA software in it is governed by the
 [NVIDIA Software License Agreement](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-software-license-agreement/) and the
 [Product-Specific Terms for NVIDIA AI Products](https://www.nvidia.com/en-us/agreements/enterprise-software/product-specific-terms-for-ai-products/).
-By running the image you accept them. The MIT license covers this repository's scripts only. The image also carries the licenses of xgrammar,
+By running the image you accept them. The Apache-2.0 license covers this repository's scripts and patches only. The image also carries the licenses of xgrammar,
 libjpeg-turbo and libwebp, which it builds.
 
 ## Credits
