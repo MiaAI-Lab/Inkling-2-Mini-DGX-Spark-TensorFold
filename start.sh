@@ -10,13 +10,14 @@
 #   ./start.sh restart --parallel 2 --context 131072
 #   CONTEXT=131072 ./start.sh restart  # a shorter window leaves memory for more streams or the prompt cache
 #   DRAFTS=0 ./start.sh restart        # no drafter (--no-drafts)
+#   DRAFTER=dflash2 ./start.sh restart # draft with the DFlash2 drafter in DFLASH2_DIR instead of DSpark
 #   VISION=0 ./start.sh restart        # text only: no vision tower (saves ~0.6 GiB)
 #   DRY_RUN=1 ./start.sh               # print the docker command and exit
 # Extra arguments go to tensorfold-native serve after the defaults, so they win.
 # Settings, from the environment or ./.env (scripts/config.sh):
-#   serving  CONTEXT, PARALLEL, MAX_TOKENS, THINKING, REASONING_EFFORT, DRAFTS, VISION, VISION_URLS,
+#   serving  CONTEXT, PARALLEL, MAX_TOKENS, THINKING, REASONING_EFFORT, DRAFTS, DRAFTER, VISION, VISION_URLS,
 #            VISION_MAX_IMAGES, VISION_IMAGE_TOKENS, TEMPERATURE, TOP_P, TOP_K, SERVED_NAME, HOST, PORT
-#   files    MODEL_DIR, KERNEL_CACHE, STATE_DIR
+#   files    MODEL_DIR, DFLASH2_DIR, KERNEL_CACHE, STATE_DIR
 #   image    IMAGE, TF_REPO, TF_REF, ZIG_VERSION, BASE_IMAGE, NATIVE_FP_DECODE, CONTAINER_NAME
 #   setup    PREPARE (auto | 1 | 0), FOREGROUND=1, WAIT_TIMEOUT, DRY_RUN=1, MEM_NEED_GIB, MEM_CHECK=0
 #   engine   every TENSORFOLD_*, TF_INKLING2_*, TF_NVFP4_*, TF_REASONING_*, TF_TOOL_CALL_* and TF_KPROF* variable goes into the
@@ -40,13 +41,21 @@ for arg in "$@"; do [[ "$arg" == -h || "$arg" == --help ]] && { usage; exit 0; }
 for v in THINKING DRAFTS VISION VISION_URLS; do [[ "${!v}" =~ ^[01]$ ]] || die "$v is 0 or 1, not ${!v}"; done
 [[ -z "$REASONING_EFFORT" || "$REASONING_EFFORT" =~ ^(none|minimal|low|medium|high|xhigh|max|0(\.[0-9]+)?)$ ]] ||
   die "REASONING_EFFORT is none, minimal, low, medium, high, xhigh, max or a number in [0, 0.99], not $REASONING_EFFORT"
+[[ "$DRAFTER" =~ ^(dspark|dflash2)$ ]] || die "DRAFTER is dspark or dflash2, not $DRAFTER"
+DRAFT_LABEL=off DRAFT_MOUNT=$MODEL_MOUNT DRAFT_ARGS=()
+if [[ "$DRAFTS" == 1 ]]; then
+  DRAFT_LABEL=DSpark
+  if [[ "$DRAFTER" == dflash2 ]]; then
+    DRAFT_LABEL=DFlash2 DRAFT_MOUNT=$DFLASH2_MOUNT DRAFT_ARGS=(-v "$DFLASH2_DIR":"$DFLASH2_MOUNT":ro)
+  fi
+fi
 DRY=0; [[ "${DRY_RUN:-0}" == 1 ]] && DRY=1
 
 SERVE_ARGS=(--context "$CONTEXT" --parallel "$PARALLEL" --max-tokens "$MAX_TOKENS"
             --temperature "$TEMPERATURE" --top-p "$TOP_P" --top-k "$TOP_K")
 if [[ "$THINKING" == 1 ]]; then SERVE_ARGS+=(--thinking); else SERVE_ARGS+=(--no-thinking); fi
 [[ -z "$REASONING_EFFORT" ]] || SERVE_ARGS+=(--reasoning-effort "$REASONING_EFFORT")
-if [[ "$DRAFTS" == 1 ]]; then SERVE_ARGS+=(--drafter "$MODEL_MOUNT"); else SERVE_ARGS+=(--no-drafts); fi
+if [[ "$DRAFTS" == 1 ]]; then SERVE_ARGS+=(--drafter "$DRAFT_MOUNT"); else SERVE_ARGS+=(--no-drafts); fi
 if [[ "$VISION" == 1 ]]; then
   SERVE_ARGS+=(--vision)
   [[ "$VISION_URLS" == 1 ]] && SERVE_ARGS+=(--vision-urls)
@@ -84,7 +93,7 @@ echo
 banner
 printf '\n%s  Mia'"'"'s TensorFold Start Script%s\n' "$M" "$R"
 printf '%s  %s · %s at once · %s-token window · %s KV · drafts %s · port %s%s\n\n' "$D" "$MODEL_LABEL" \
-  "$(arg_value --parallel)" "$(arg_value --context)" "$KV_DTYPE" "$( [[ "$DRAFTS" == 1 ]] && echo DSpark || echo off)" "$PORT" "$R"
+  "$(arg_value --parallel)" "$(arg_value --context)" "$KV_DTYPE" "$DRAFT_LABEL" "$PORT" "$R"
 STEPS=5
 step() { printf '%s[%s/%s]%s %s%s%s\n' "$M" "$1" "$STEPS" "$R" "$B" "$2" "$R"; }
 
@@ -122,6 +131,13 @@ fi
 KCACHE=$(docker image inspect -f '{{index .Config.Labels "tf.patches"}}' "$IMAGE" 2>/dev/null || true)
 [[ "$KCACHE" =~ ^[0-9a-f]{12}$ ]] || KCACHE=$(image_hash)
 [[ -f "$MODEL_DIR/config.json" && -f "$MODEL_DIR/$MTP_NAME" ]] || missing "$MODEL_DIR holds no Inkling-2-Mini checkpoint (config.json, $MTP_NAME): set MODEL_DIR"
+if [[ "$DRAFT_LABEL" == DFlash2 ]]; then
+  if [[ ! -f "$DFLASH2_DIR/config.json" || ! -f "$DFLASH2_DIR/model.safetensors" ]]; then
+    missing "$DFLASH2_DIR holds no DFlash2 drafter (config.json, model.safetensors): set DFLASH2_DIR, or see DRAFTER in scripts/config.sh"
+  elif [[ "$(sha256sum "$DFLASH2_DIR/model.safetensors" | cut -d' ' -f1)" != "$DFLASH2_SHA256" ]]; then
+    missing "$DFLASH2_DIR/model.safetensors is not the pinned DFlash2 drafter (SHA-256 $DFLASH2_SHA256)"
+  fi
+fi
 
 step 2 "Checks: arguments, previous server, port, memory"
 if (( have_image )); then
@@ -174,7 +190,7 @@ here_cmd=(docker run -d --name "$CONTAINER_NAME"
           --gpus all --ipc=host --network host
           --ulimit memlock=-1 --ulimit stack=67108864
           ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} ${KEY_ARGS[@]+"${KEY_ARGS[@]}"}
-          -v "$MODEL_DIR":"$MODEL_MOUNT":ro
+          -v "$MODEL_DIR":"$MODEL_MOUNT":ro ${DRAFT_ARGS[@]+"${DRAFT_ARGS[@]}"}
           -v "$KERNEL_CACHE/$KCACHE":/cache
           "$IMAGE"
           tensorfold-native serve "$MODEL_MOUNT" --name "$SERVED_NAME" --host "$HOST" --port "$PORT"
@@ -191,7 +207,7 @@ if [[ "${FOREGROUND:-0}" == 1 ]]; then
   exit "$(docker inspect -f '{{.State.ExitCode}}' "$CONTAINER_NAME" 2>/dev/null || echo 1)"
 fi
 
-step 4 "Loading: ~$WEIGHTS_GIB GiB of weights and the DSpark drafter"
+step 4 "Loading: ~$WEIGHTS_GIB GiB of weights, drafts $DRAFT_LABEL"
 NOISE='^\s*$|^=+$|^== PyTorch ==|^NVIDIA Release|Copyright|All rights reserved|PyTorch Version|Various files include|NOTE: CUDA Forward|Using CUDA|cuda-compatibility|Container image|^\[tensorfold\] [^ ]+ "GET /(health|v1/models|models|metrics|stats|slots)[ ?]'
 docker logs -f "$CONTAINER_NAME" > >(grep --line-buffered -v -E "$NOISE" | sed -u "s/^/  ${D}│${R} /") 2>&1 &
 LOGS_PID=$!
@@ -258,7 +274,7 @@ cat <<EOF
     API      http://${IP:-<spark-address>}:$PORT/v1   (model: $SERVED)
     Loaded   in ${LOADED_S}s · ${avail_gb} GiB was free
     Model    $MODEL_DIR ($QUANT_LABEL)
-    Window   $(arg_value --context) tokens · $(arg_value --parallel) at once · $KV_DTYPE KV · drafts $( [[ "$DRAFTS" == 1 ]] && echo DSpark || echo off)
+    Window   $(arg_value --context) tokens · $(arg_value --parallel) at once · $KV_DTYPE KV · drafts $DRAFT_LABEL
     Logs     docker logs -f $CONTAINER_NAME
     Restart  ./start.sh restart
     Stop     ./stop.sh

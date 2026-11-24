@@ -164,6 +164,8 @@ All defaults live in [`scripts/config.sh`](scripts/config.sh). Override them fro
 | `CONTEXT` | `262144` | prompt + reply window a stream (up to `1048576`) |
 | `KV_DTYPE` | `fp8` | target KV cache: `fp8` or `bf16` (exact) |
 | `DRAFTS` | `1` | `1`: DSpark drafter (`--drafter /models/ink`); `0`: `--no-drafts` |
+| `DRAFTER` | `dspark` | `dflash2`: draft with [`incoai/Inkling-2-Mini-DFlash2`](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2) from `DFLASH2_DIR` (see [DFlash2](#dflash2-drafter)) |
+| `DFLASH2_DIR` | `$HOME/models/hf/Inkling-2-Mini-DFlash2` | the DFlash2 drafter's folder, mounted read-only and checked by SHA-256 |
 | `VISION` | `1` | `1`: Inkling 2 vision tower (`--vision`, ~0.59 GiB, PNG/JPEG/WebP); `0`: text only |
 | `VISION_URLS` | `0` | `1`: also fetch http(s) image URLs (`--vision-urls`); `data:` URLs always work |
 | `VISION_MAX_IMAGES` / `VISION_IMAGE_TOKENS` | unset | images a request (engine default 4, up to 100) and an image's token budget (default 4,096) |
@@ -192,7 +194,36 @@ All defaults live in [`scripts/config.sh`](scripts/config.sh). Override them fro
 - **Exact serial reference:** `"draft": false` on any request turns drafting off. Drafted replies match `"draft": false` token for token.
 - **Admission:** when all `PARALLEL` slots are full, new requests are rejected rather than queued.
 
-## Patches (`patches/0001`–`0017`)
+## DFlash2 drafter
+
+`DRAFTER=dflash2` (patch `0018`) drafts with [`incoai/Inkling-2-Mini-DFlash2`](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2)
+instead of DSpark. Replies stay the target's: drafted output equals `"draft": false` token for token.
+
+```bash
+hf download incoai/Inkling-2-Mini-DFlash2 config.json model.safetensors \
+  --revision 4f9088ea66c21f2b99ed657d1941c306b03e84d2 --local-dir ~/models/hf/Inkling-2-Mini-DFlash2
+DRAFTER=dflash2 ./start.sh restart
+```
+
+Decode on one DGX Spark with the GPU clock capped at 1,600 MHz (`CONTEXT=262144`, `PARALLEL=4`, fp8 KV, 10 prompts of up to
+512 reply tokens; one stream: tok/s a stream, four: total tok/s):
+
+| | DSpark | DFlash2 | |
+| --- | ---: | ---: | ---: |
+| ×1 greedy | 50.7 | **60.7** | 1.20x |
+| ×1 greedy, thinking | 52.6 | **64.3** | 1.22x |
+| ×1 temp 1 | 48.6 | **57.3** | 1.18x |
+| ×1 temp 1, thinking | 50.0 | **57.2** | 1.14x |
+| ×4 greedy | 93.4 | **106.1** | 1.14x |
+| ×4 greedy, thinking | 94.3 | **109.5** | 1.16x |
+| ×4 temp 1 | 87.4 | **101.5** | 1.16x |
+| ×4 temp 1, thinking | 88.7 | **101.0** | 1.14x |
+
+Prefill is unchanged (8k: 2,761 vs 2,767 tok/s). Memory: 1.12 GiB plus 0.04 GiB a stream (DSpark: 1.54 GiB plus 1.01 GiB a stream
+at 262,144 tokens). With the whole block drafted every round it accepts what vLLM's DFlash2 does on the same prompts (3.0–3.5
+tokens a round); `tools/exact.py` passes at pads 0, 3k and 24k.
+
+## Patches (`patches/0001`–`0018`)
 
 Applied in order onto TensorFold `dc2ca8a1` (PR #4441) by `scripts/prepare.sh`:
 
@@ -206,6 +237,7 @@ Applied in order onto TensorFold `dc2ca8a1` (PR #4441) by `scripts/prepare.sh`:
 | `0015` | Blackwell native block-scaled tensor-core prefill experts (`sm_121a`, `TF_INKLING2_PREFILL_TC=1`): prompt activations quantized once a layer (38 MiB of scratch), then `kind::mxf4nvf4` (layers 0–19) and `kind::mxf8f6f4` (20–23) run directly over TensorFold's packed weights |
 | `0016` | Native CUDA vision encoder (`inkling2_vision`): `Inkling2ImageProcessor` (PNG/JPEG/WebP, EXIF orientation, 8×8 checkerboard alpha, `-1.0` padding to 40×40 tiles), the 23-layer ViT with 2D pairwise axial RoPE, LayerScale and bilinear position embeddings, `vision_kernel<64, 8>` tensor-core attention, the 2×2 spatial merge and GELU projector, and image embeddings spliced into the prompt (`--vision`) |
 | `0017` | Server fixes: the reply grammar is freed when a stream fails to start (`lane_stream.zig`); opt-in `TF_TOOL_CALL_GUARD=1` and rejected tool-envelope logs (`TF_TOOL_CALL_DEBUG=1`); `--vision-max-images` up to 100; `--dashboard-open` |
+| `0018` | The DFlash2 drafter on CUDA (`DRAFTER=dflash2`): five sliding layers with dynamic convolutions, the target head's top 16 and the selector walk, batched over streams, sampled drafts keyed to the target's draws |
 
 ## Tools
 
@@ -225,7 +257,7 @@ Applied in order onto TensorFold `dc2ca8a1` (PR #4441) by `scripts/prepare.sh`:
 start.sh      set up (first run) and start the server
 stop.sh       stop it
 scripts/      config.sh, prepare.sh, fetch.sh, banner.sh
-patches/      0001–0017 applied onto TensorFold at TF_REF
+patches/      0001–0018 applied onto TensorFold at TF_REF
 tools/        verification scripts
 CREDITS.md    upstream credits
 NOTICE        third-party notices

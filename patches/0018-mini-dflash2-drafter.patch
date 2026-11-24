@@ -1,0 +1,1148 @@
+diff --git a/zig/build/cuda_kernels.zig b/zig/build/cuda_kernels.zig
+index d39a7f9..3adeaf6 100644
+--- a/zig/build/cuda_kernels.zig
++++ b/zig/build/cuda_kernels.zig
+@@ -166,6 +166,7 @@ pub const kernels = [_]Kernel{
+     .{ .name = "inkling2_rows", .src = "inkling2/rows", .flags = glue }, // ours: Inkling 2's router row dots on prompt rows
+     .{ .name = "inkling2_loop", .src = "inkling2/loop", .flags = glue }, // Inkling 2 Mini: loop messages, gates
+     .{ .name = "inkling2_mtp", .src = "inkling2/mtp", .flags = glue }, // Inkling 2 Mini: DSpark drafter, taps, conv backups
++    .{ .name = "inkling2_dflash2", .src = "inkling2/dflash2", .flags = glue }, // Inkling 2 Mini: DFlash2 drafter
+     .{ .name = "glm_quant", .flags = torch_ops }, // ours: GLM's draft-only weight quantizers, torch at load in the Python family
+     .{ .name = "exl3_linear", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // exl3/linear.cu's device code, tensorfold_exl3_linear_v5
+     .{ .name = "exl3_experts", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // exl3/experts.cu's device code, tensorfold_exl3_experts
+diff --git a/zig/kernels/cuda/inkling2/dflash2.cu b/zig/kernels/cuda/inkling2/dflash2.cu
+new file mode 100644
+index 0000000..1ba255f
+--- /dev/null
++++ b/zig/kernels/cuda/inkling2/dflash2.cu
+@@ -0,0 +1,259 @@
++// Inkling 2 Mini's DFlash2 drafter (incoai/Inkling-2-Mini-DFlash2) past the DSpark kernels it shares (mtp.cu: RoPE'd
++// context and block keys, resnorm, merge, SwiGLU, FP8 repacks): two-tap dynamic convolutions, the windowed block
++// attention, top 16 of the target head's rows and the selector walk. Math: the model card's SGLang drafter and vLLM's
++// DFlash2; the layouts follow muse_spark/dflash2.cu and the Metal drafter (#4917).
++#include <cstdint>
++#include <cuda_bf16.h>
++#include <cuda_fp16.h>
++
++#include "common/reduce.cuh"
++
++namespace ink2d {
++
++constexpr int kD = 128;
++constexpr int kBlock = 8;
++constexpr int kMaxQ = 32;  // a key head's query rows in a block: 8 rows x 4 heads
++constexpr int kKT = 32;
++constexpr int kChunk = 1024;
++constexpr int kTop = 16;
++
++__device__ __forceinline__ float bf(uint16_t u) { return __uint_as_float(static_cast<uint32_t>(u) << 16); }
++__device__ __forceinline__ uint16_t tobf(float f) { return __bfloat16_as_ushort(__float2bfloat16_rn(f)); }
++__device__ __forceinline__ bool beats(float va, int ia, float vb, int ib) { return va > vb || (va == vb && ia < ib); }
++
++// mtp.cu's DraftKey and keyed uniform (sample.cu's, bit for bit)
++struct DraftKey {
++    unsigned long long seed;
++    float inv_t; // 0: greedy drafts
++    unsigned pos;
++};
++__device__ __forceinline__ unsigned long long kmix(unsigned long long x) {
++    x ^= x >> 30;
++    x *= 0xBF58476D1CE4E5B9ull;
++    x ^= x >> 27;
++    x *= 0x94D049BB133111EBull;
++    return x ^ (x >> 31);
++}
++__device__ __forceinline__ float race_u(unsigned long long seed, unsigned pos, unsigned id) {
++    unsigned long long x = kmix(seed + 0x9E3779B97F4A7C15ull);
++    x = kmix(x ^ (static_cast<unsigned long long>(pos) * 0xD1B54A32D192ED03ull));
++    x = kmix(x ^ static_cast<unsigned long long>(id));
++    const float u = (static_cast<float>(static_cast<unsigned>(x >> 40)) + 0.5f) * (1.0f / 16777216.0f);
++    return fminf(u, __uint_as_float(0x3F7FFFFFu));
++}
++
++}  // namespace ink2d
++
++// Y[r, c] = sum_t (base[side, t, c] + dyn[r, side, t, c / group]) * X[r - t, c] within r's 8-row block, t in {0, 1}:
++// fp32 sums, one bf16 round. dyn bf16 [rows][2][2][groups]. Not in place. Block a row.
++extern "C" __global__ void __launch_bounds__(256) tf_ink2d_conv(const uint16_t* __restrict__ X, const uint16_t* __restrict__ dyn,
++                                                                const uint16_t* __restrict__ base, uint16_t* __restrict__ Y, int C,
++                                                                int group, int side) {
++    using namespace ink2d;
++    const size_t r = blockIdx.x;
++    const int groups = C / group;
++    const bool prev = r % kBlock != 0;
++    const uint16_t* d = dyn + r * 4 * groups + side * 2 * groups;
++    for (int c = threadIdx.x; c < C; c += blockDim.x) {
++        const int g = c / group;
++        float y = (bf(base[side * 2 * C + c]) + bf(d[g])) * bf(X[r * C + c]);
++        if (prev) y += (bf(base[(side * 2 + 1) * C + c]) + bf(d[groups + g])) * bf(X[(r - 1) * C + c]);
++        Y[r * C + c] = tobf(y);
++    }
++}
++
++struct DfAttnArgs {
++    const uint16_t* q;  // bf16 [T][hq][128]
++    const uint16_t* kc;  // bf16 [ring][hk][128]
++    const uint16_t* vc;
++    float* po;   // fp32 [chunks][T * hq][128]: unnormalised sums
++    float* pml;  // fp32 [chunks][T * hq][2]: max, total
++    int T, hq, hk, ring, lo, hi, c0, window;
++    float scale;
++};
++
++// tf_ink2m_attn at 32 query rows a key head, with a sliding window: the block's row i (position hi - T + 1 + i) sees
++// the context from its position - window + 1 on, and the whole block.
++extern "C" __global__ void __launch_bounds__(256) tf_ink2d_attn(DfAttnArgs a) {
++    using namespace ink2d;
++    __shared__ float sq[kMaxQ][kD];
++    __shared__ uint16_t sk[kKT][kD + 8];
++    __shared__ uint16_t sv[kKT][kD];
++    __shared__ float sp[kMaxQ][kKT];
++    __shared__ float sm[kMaxQ], sl[kMaxQ], sa[kMaxQ];
++    const int j = blockIdx.y, c = a.c0 + blockIdx.x, tid = threadIdx.x;
++    const int g = a.hq / a.hk, nq = a.T * g, nqt = a.T * a.hq;
++    const int anchor = a.hi - a.T + 1;
++    const int k0 = max(a.lo, c * kChunk), k1 = min(a.hi + 1, (c + 1) * kChunk);
++    for (int idx = tid; idx < nq * kD; idx += blockDim.x) {
++        const int qi = idx / kD, d = idx % kD;
++        sq[qi][d] = bf(a.q[(static_cast<size_t>(qi / g) * a.hq + j * g + qi % g) * kD + d]);
++    }
++    for (int qi = tid; qi < nq; qi += blockDim.x) {
++        sm[qi] = -INFINITY;
++        sl[qi] = 0.0f;
++    }
++    const int d = tid & (kD - 1), half = tid >> 7;
++    float o[kMaxQ / 2];
++#pragma unroll
++    for (int r = 0; r < kMaxQ / 2; ++r) o[r] = 0.0f;
++    __syncthreads();
++    for (int kt = k0; kt < k1; kt += kKT) {
++        const int nk = min(kKT, k1 - kt);
++        for (int idx = tid; idx < nk * kD; idx += blockDim.x) {
++            const int kk = idx / kD, dd = idx % kD;
++            const size_t at = (static_cast<size_t>((kt + kk) % a.ring) * a.hk + j) * kD + dd;
++            sk[kk][dd] = a.kc[at];
++            sv[kk][dd] = a.vc[at];
++        }
++        __syncthreads();
++        for (int idx = tid; idx < nq * kKT; idx += blockDim.x) {
++            const int qi = idx / kKT, kk = idx % kKT;
++            float s = -INFINITY;
++            if (kk < nk && kt + kk > anchor + qi / g - a.window) {
++                s = 0.0f;
++                for (int dd = 0; dd < kD; ++dd) s += sq[qi][dd] * bf(sk[kk][dd]);
++                s *= a.scale;
++            }
++            sp[qi][kk] = s;
++        }
++        __syncthreads();
++        for (int qi = tid; qi < nq; qi += blockDim.x) {
++            float mx = sm[qi];
++            for (int kk = 0; kk < nk; ++kk) mx = fmaxf(mx, sp[qi][kk]);
++            float al = 0.0f, sum = 0.0f;
++            if (mx == -INFINITY) {  // every key so far is past this row's window
++                for (int kk = 0; kk < nk; ++kk) sp[qi][kk] = 0.0f;
++            } else {
++                al = expf(sm[qi] - mx);
++                for (int kk = 0; kk < nk; ++kk) {
++                    const float p = expf(sp[qi][kk] - mx);
++                    sp[qi][kk] = p;
++                    sum += p;
++                }
++            }
++            sl[qi] = sl[qi] * al + sum;
++            sm[qi] = mx;
++            sa[qi] = al;
++        }
++        __syncthreads();
++#pragma unroll
++        for (int r = 0; r < kMaxQ / 2; ++r) {
++            const int qi = half * (kMaxQ / 2) + r;
++            if (qi < nq) {
++                float acc = o[r] * sa[qi];
++                for (int kk = 0; kk < nk; ++kk) acc += sp[qi][kk] * bf(sv[kk][d]);
++                o[r] = acc;
++            }
++        }
++        __syncthreads();
++    }
++#pragma unroll
++    for (int r = 0; r < kMaxQ / 2; ++r) {
++        const int qi = half * (kMaxQ / 2) + r;
++        if (qi >= nq) continue;
++        const size_t rh = static_cast<size_t>(blockIdx.x) * nqt + (qi / g) * a.hq + j * g + qi % g;
++        a.po[rh * kD + d] = o[r];
++        if (d == 0) {
++            a.pml[rh * 2] = sm[qi];
++            a.pml[rh * 2 + 1] = sl[qi];
++        }
++    }
++}
++
++// The top 16 (value descending, then id) of draft rows' raw bf16 logits: out [streams * 7][32] = 16 values, then their
++// ids as bits. head [streams * 8][V], each block's row 0 skipped. Grid (streams * 7).
++extern "C" __global__ void __launch_bounds__(256) tf_ink2d_topk(const uint16_t* __restrict__ head, int V, float* __restrict__ out) {
++    using namespace ink2d;
++    __shared__ float hv[256];
++    __shared__ int hi[256];
++    __shared__ int ht[256];
++    const int t = threadIdx.x, s = blockIdx.x / (kBlock - 1), i = blockIdx.x % (kBlock - 1);
++    const uint16_t* row = head + static_cast<size_t>(s * kBlock + 1 + i) * V;
++    float v[kTop];
++    int id[kTop];
++#pragma unroll
++    for (int k = 0; k < kTop; ++k) {
++        v[k] = -INFINITY;
++        id[k] = 0x7fffffff;
++    }
++    for (int c = t; c < V; c += 256) {
++        const float x = bf(row[c]);
++        if (!(x > v[kTop - 1])) continue;  // a thread's ids ascend: a tie loses; NaN is never a candidate
++        int k = kTop - 1;
++        while (k > 0 && x > v[k - 1]) {
++            v[k] = v[k - 1];
++            id[k] = id[k - 1];
++            --k;
++        }
++        v[k] = x;
++        id[k] = c;
++    }
++    float* o = out + static_cast<size_t>(blockIdx.x) * 2 * kTop;
++    int ptr = 0;
++    for (int pick = 0; pick < kTop; ++pick) {
++        hv[t] = ptr < kTop ? v[ptr] : -INFINITY;
++        hi[t] = ptr < kTop ? id[ptr] : 0x7fffffff;
++        ht[t] = t;
++        __syncthreads();
++        for (int h = 128; h > 0; h >>= 1) {
++            if (t < h && beats(hv[t + h], hi[t + h], hv[t], hi[t])) {
++                hv[t] = hv[t + h];
++                hi[t] = hi[t + h];
++                ht[t] = ht[t + h];
++            }
++            __syncthreads();
++        }
++        if (t == 0) {
++            o[pick] = hv[0];
++            o[kTop + pick] = __int_as_float(hi[0]);
++        }
++        const int won = ht[0];
++        __syncthreads();
++        if (t == won) ++ptr;
++    }
++}
++
++// The selector: walk[1 + i] = the best of position i's candidates by cap * tanh((unary + edge) / cap), edge =
++// sum_r pred[prev][r] * hid[i][r] * succ[cand][r]; a sampled stream's scores race with the target's own noise. 512
++// threads: a warp a candidate. A block a stream.
++extern "C" __global__ void __launch_bounds__(512) tf_ink2d_walk(const float* __restrict__ top, const uint16_t* __restrict__ hid, int R,
++                                                                const uint16_t* __restrict__ pred, const uint16_t* __restrict__ succ,
++                                                                float cap, int n, const ink2d::DraftKey* __restrict__ keys,
++                                                                int* __restrict__ walk) {
++    using namespace ink2d;
++    __shared__ float sc[kTop];
++    __shared__ int prev;
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    if (threadIdx.x == 0) prev = walk[0];
++    __syncthreads();
++    for (int i = 0; i < n; ++i) {
++        const float* row = top + static_cast<size_t>(i) * 2 * kTop;
++        const int c = __float_as_int(row[kTop + warp]);
++        const bool live = c != 0x7fffffff;
++        const uint16_t* h = hid + static_cast<size_t>(1 + i) * R;
++        float acc = 0.0f;
++        if (live)
++            for (int r = lane; r < R; r += 32) acc += bf(pred[static_cast<size_t>(prev) * R + r]) * bf(h[r]) * bf(succ[static_cast<size_t>(c) * R + r]);
++        acc = tf_common::warp_sum(acc);
++        if (lane == 0) {
++            float s = -INFINITY;
++            if (live) {
++                s = tanhf((row[warp] + acc) / cap) * cap;
++                if (keys != nullptr && keys->inv_t > 0.0f)
++                    s = s * keys->inv_t - logf(-logf(race_u(keys->seed, keys->pos + static_cast<unsigned>(i), static_cast<unsigned>(c))));
++            }
++            sc[warp] = s;
++        }
++        __syncthreads();
++        if (threadIdx.x == 0) {
++            int best = 0;
++            for (int k = 1; k < kTop; ++k)
++                if (sc[k] > sc[best]) best = k;
++            const int id = __float_as_int(row[kTop + best]);
++            prev = id == 0x7fffffff ? 0 : id;
++            walk[1 + i] = prev;
++        }
++        __syncthreads();
++    }
++}
+diff --git a/zig/src/cuda/kernels.zig b/zig/src/cuda/kernels.zig
+index af658d1..699659f 100644
+--- a/zig/src/cuda/kernels.zig
++++ b/zig/src/cuda/kernels.zig
+@@ -116,6 +116,7 @@ pub const inkling2_ops: []const u8 = if (available) &Blob("fatbin_inkling2_ops")
+ pub const inkling2_rows: []const u8 = if (available) &Blob("fatbin_inkling2_rows").bytes else &.{};
+ pub const inkling2_loop: []const u8 = if (available) &Blob("fatbin_inkling2_loop").bytes else &.{};
+ pub const inkling2_mtp: []const u8 = if (available) &Blob("fatbin_inkling2_mtp").bytes else &.{};
++pub const inkling2_dflash2: []const u8 = if (available) &Blob("fatbin_inkling2_dflash2").bytes else &.{};
+ pub const glm_quant: []const u8 = if (available) &Blob("fatbin_glm_quant").bytes else &.{};
+ pub const glm_vision: []const u8 = if (available) &Blob("fatbin_glm_vision").bytes else &.{};
+ pub const glm_mm: []const u8 = if (available) &Blob("fatbin_glm_mm").bytes else &.{};
+diff --git a/zig/src/families/inkling2/inkling2.zig b/zig/src/families/inkling2/inkling2.zig
+index c47b288..bda665b 100644
+--- a/zig/src/families/inkling2/inkling2.zig
++++ b/zig/src/families/inkling2/inkling2.zig
+@@ -15,6 +15,8 @@ pub const mini_image = @import("mini_image.zig");
+ pub const mini_vision = @import("mini_vision.zig");
+ /// The DSpark drafter (mtp.safetensors) on the target's stream.
+ pub const mini_dspark = @import("mini_dspark.zig");
++/// The DFlash2 drafter (an external DFlash2DraftModel folder) on the target's stream.
++pub const mini_dflash2 = @import("mini_dflash2.zig");
+ /// The float64 reference the CUDA forward's greedy tokens are checked against.
+ pub const mini_ref = @import("mini_ref.zig");
+ /// The native CUDA registry's entry for inkling2_loop (native/cuda_families.zig).
+@@ -33,6 +35,7 @@ test {
+     _ = @import("mini_visit.zig");
+     _ = mini_weights;
+     _ = mini_dspark;
++    _ = mini_dflash2;
+     _ = mini_backend;
+     _ = mini_snap;
+     _ = mini_image;
+diff --git a/zig/src/families/inkling2/mini_dflash2.zig b/zig/src/families/inkling2/mini_dflash2.zig
+new file mode 100644
+index 0000000..e8bd988
+--- /dev/null
++++ b/zig/src/families/inkling2/mini_dflash2.zig
+@@ -0,0 +1,782 @@
++//! Inkling 2 Mini's DFlash2 drafter (incoai/Inkling-2-Mini-DFlash2) on CUDA: committed target features into five
++//! layers' sliding context rings, an eight-row block through them with two-tap dynamic convolutions, the target head's
++//! top 16 a row and the selector's walk. It taps what DSpark taps and runs on the target's stream; its lanes, rings,
++//! FP8 repacks and shared kernels are mini_dspark.zig's. Math: the release's SGLang drafter and vLLM's DFlash2 (taps
++//! as visits, embed_norm on the block's inputs, the soft cap after the edges).
++const std = @import("std");
++const cuda = @import("cuda");
++const core = @import("core");
++const lanes = @import("lanes");
++const wts = @import("mini_weights.zig");
++const mm = @import("mini_model.zig");
++const ops = @import("ops.zig");
++const dspark = @import("mini_dspark.zig");
++
++const dr = lanes.drafter;
++const Stream = lanes.Stream;
++const Lane = cuda.qmmf.Weight;
++const DeviceBuffer = cuda.DeviceBuffer;
++const HoldCost = lanes.hold_price.HoldCost;
++
++pub const taps = dspark.taps;
++pub const hidden = dspark.hidden;
++const layers_n = 5;
++pub const heads = 32;
++pub const kv_heads = 8;
++pub const head_dim = 128;
++const q_width = heads * head_dim;
++const kv_width = kv_heads * head_dim;
++pub const inter = 6912;
++pub const rank = 256;
++const top_k = 16;
++const conv_group = 16;
++const dyn_width = 4 * (hidden / conv_group);
++pub const block = 8;
++pub const depth = block - 1;
++pub const window = 2048;
++const codebook_vocab = 201024;
++const mask_token = 200056;
++const eps: f32 = 1e-6;
++const theta: f32 = 10000;
++const cap: f32 = 30.0;
++/// A layer's ring: the window, the block, rounded to 128.
++pub const ring = std.mem.alignForward(usize, window + block, 128);
++/// The committed rows a block can ever read: what an absorb keeps of a longer chunk (and what one pass writes: no more
++/// than the ring, so no slot is written twice).
++const keep_rows = window + block;
++const chunk = 1024;
++const row_bytes = taps.len * hidden * 2;
++/// Streams one batched hold encodes together; more are taken in groups.
++pub const max_batch = 8;
++
++/// A hold pass's ms on one GB10 (TF_INKLING2_DRAFT_TRACE=1): the block costs the same at every depth.
++const hold_costs = [_]HoldCost{
++    .{ .streams = 1, .depth = 1, .ms = 6.0 }, .{ .streams = 1, .depth = 7, .ms = 6.0 },
++    .{ .streams = 2, .depth = 1, .ms = 9.1 }, .{ .streams = 2, .depth = 7, .ms = 9.1 },
++    .{ .streams = 4, .depth = 1, .ms = 11.0 }, .{ .streams = 4, .depth = 7, .ms = 11.0 },
++};
++/// The target's lone-stream window ms by rows (mini_backend.zig's lone_costs): with them the depth rule weighs every
++/// depth, without them it drafts at most three. DFlash2's later drafts land often enough to want the deeper windows.
++const window_costs = [_]lanes.config.Cost{
++    .{ .width = 1, .ms = 30.1 }, .{ .width = 2, .ms = 36.1 }, .{ .width = 3, .ms = 39.9 }, .{ .width = 4, .ms = 44.9 },
++    .{ .width = 5, .ms = 47.8 }, .{ .width = 6, .ms = 50.6 }, .{ .width = 7, .ms = 54.6 }, .{ .width = 8, .ms = 58.7 }, .{ .width = 9, .ms = 61.0 },
++};
++/// Per-depth acceptance until a stream has its own (vLLM's DFlash2 counters on this repo's ab_bench prompts).
++const prior = [depth]f64{ 0.70, 0.68, 0.72, 0.72, 0.77, 0.77, 0.79 };
++
++fn on(name: [*:0]const u8) bool {
++    const v = std.c.getenv(name) orelse return true;
++    return v[0] != '0';
++}
++
++/// A stream's caches: five rings (K and V bf16) and the walk.
++pub fn laneBytes() usize {
++    return layers_n * 2 * ring * kv_width * 2 + 256;
++}
++
++fn readConfig(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) ![]u8 {
++    const path = try std.fs.path.join(gpa, &.{ dir, "config.json" });
++    defer gpa.free(path);
++    return std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 22));
++}
++
++/// Whether --drafter's folder is a DFlash2 drafter (its config.json names the architecture); no config: no.
++pub fn isDFlash2(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !bool {
++    const text = readConfig(gpa, io, dir) catch |e| switch (e) {
++        error.OutOfMemory => return e,
++        else => return false,
++    };
++    defer gpa.free(text);
++    return std.mem.indexOf(u8, text, "\"DFlash2DraftModel\"") != null;
++}
++
++fn want(o: std.json.ObjectMap, name: []const u8, v: i64) !void {
++    const x = o.get(name) orelse return refuse(name);
++    if (x != .integer or x.integer != v) return refuse(name);
++}
++
++fn wantNumber(o: std.json.ObjectMap, name: []const u8, v: f64) !void {
++    const x = o.get(name) orelse return refuse(name);
++    const got: f64 = switch (x) {
++        .integer => |i| @floatFromInt(i),
++        .float => |f| f,
++        else => return refuse(name),
++    };
++    if (@abs(got - v) > 1e-9 + 1e-6 * @abs(v)) return refuse(name);
++}
++
++fn refuse(name: []const u8) error{DFlash2Config} {
++    std.log.warn("Inkling 2 Mini DFlash2: config.json's {s} is not the released drafter's", .{name});
++    return error.DFlash2Config;
++}
++
++/// config.json must be the released drafter's shape: every constant above is checked, none is assumed.
++fn admitConfig(gpa: std.mem.Allocator, text: []const u8) !void {
++    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, text, .{});
++    defer parsed.deinit();
++    if (parsed.value != .object) return refuse("object");
++    const o = parsed.value.object;
++    inline for (.{ .{ "hidden_size", hidden }, .{ "num_hidden_layers", layers_n }, .{ "num_attention_heads", heads }, .{ "num_key_value_heads", kv_heads }, .{ "head_dim", head_dim }, .{ "intermediate_size", inter }, .{ "sliding_window", window }, .{ "vocab_size", codebook_vocab } }) |f| try want(o, f[0], f[1]);
++    try wantNumber(o, "rms_norm_eps", 1e-6);
++    const causal = o.get("is_causal") orelse return refuse("is_causal");
++    if (causal != .bool or causal.bool) return refuse("is_causal");
++    const kinds = o.get("layer_types") orelse return refuse("layer_types");
++    if (kinds != .array or kinds.array.items.len != layers_n) return refuse("layer_types");
++    for (kinds.array.items) |k| if (k != .string or !std.mem.eql(u8, k.string, "sliding_attention")) return refuse("layer_types");
++    const rope = o.get("rope_parameters") orelse return refuse("rope_parameters");
++    if (rope != .object) return refuse("rope_parameters");
++    try wantNumber(rope.object, "rope_theta", 10000);
++    const kind = rope.object.get("rope_type") orelse return refuse("rope_type");
++    if (kind != .string or !std.mem.eql(u8, kind.string, "default")) return refuse("rope_type");
++    const d = o.get("dflash_config") orelse return refuse("dflash_config");
++    if (d != .object) return refuse("dflash_config");
++    inline for (.{ .{ "block_size", block }, .{ "conv_group_size", conv_group }, .{ "conv_kernel_size", 2 }, .{ "mask_token_id", mask_token }, .{ "selector_rank", rank }, .{ "selector_top_k", top_k } }) |f| try want(d.object, f[0], f[1]);
++    try wantNumber(d.object, "final_logit_softcapping", cap);
++    const mode = d.object.get("selector_softcap_mode") orelse return refuse("selector_softcap_mode");
++    if (mode != .string or !std.mem.eql(u8, mode.string, "after_correction")) return refuse("selector_softcap_mode");
++    const t = d.object.get("target_layer_ids") orelse return refuse("target_layer_ids");
++    if (t != .array or t.array.items.len != taps.len) return refuse("target_layer_ids");
++    for (t.array.items, taps) |x, y| if (x != .integer or x.integer != y) return refuse("target_layer_ids");
++}
++
++const Conv = struct { proj: Lane, base: u64 };
++
++const Layer = struct {
++    qkv: Lane, // [q | k | v][H]
++    ctx: Lane, // [k | v][H], the same rows in bf16: committed context
++    o: Lane,
++    gu: Lane, // [gate | up][H]
++    down: Lane,
++    aconv: Conv,
++    mconv: Conv,
++    input_norm: u64,
++    post_norm: u64,
++    q_norm: u64,
++    k_norm: u64,
++};
++
++const Kernels = struct {
++    mtp: cuda.Module,
++    mod: cuda.Module,
++    // mtp.cu's
++    ctx_kv: cuda.Function,
++    init_rows: cuda.Function,
++    resnorm: cuda.Function,
++    block_qkv: cuda.Function,
++    merge: cuda.Function,
++    swiglu: cuda.Function,
++    amax: cuda.Function,
++    fp8_lane: cuda.Function,
++    // dflash2.cu's
++    conv: cuda.Function,
++    attn: cuda.Function,
++    topk: cuda.Function,
++    walk: cuda.Function,
++
++    fn load(d: *const cuda.Driver) !Kernels {
++        if (!cuda.kernels.available) return error.BuiltWithoutKernels;
++        var k: Kernels = undefined;
++        k.mtp = try cuda.Module.load(d, cuda.kernels.inkling2_mtp);
++        errdefer k.mtp.unload();
++        k.mod = try cuda.Module.load(d, cuda.kernels.inkling2_dflash2);
++        errdefer k.mod.unload();
++        inline for (.{ "ctx_kv", "init_rows", "resnorm", "block_qkv", "merge", "swiglu", "amax", "fp8_lane" }) |name| @field(k, name) = try k.mtp.function("tf_ink2m_" ++ name);
++        inline for (.{ "conv", "attn", "topk", "walk" }) |name| @field(k, name) = try k.mod.function("tf_ink2d_" ++ name);
++        return k;
++    }
++};
++
++/// dflash2.cu's DfAttnArgs.
++const AttnArgs = extern struct {
++    q: u64,
++    kc: u64,
++    vc: u64,
++    po: u64,
++    pml: u64,
++    T: i32,
++    hq: i32,
++    hk: i32,
++    ring: i32,
++    lo: i32,
++    hi: i32,
++    c0: i32,
++    window: i32,
++    scale: f32,
++};
++
++/// dflash2.cu's ink2d::DraftKey.
++const DraftKey = extern struct { seed: u64, inv_t: f32, pos: u32 };
++
++const Slot = struct {
++    k: [layers_n]u64,
++    v: [layers_n]u64,
++    walk: u64, // int32 [block]: the pending token, then the drafts
++    used: bool = false,
++};
++
++const LaneState = struct {
++    slot: usize,
++    from: u64 = 0, // the first committed row the rings hold (a resumed prompt starts past 0)
++    end: u64 = 0, // rows [from, end) absorbed
++    held: u32 = 0,
++};
++
++const Item = struct { l: *LaneState, sl: *const Slot, anchor: u64, n: usize };
++
++pub const Drafter = struct {
++    gpa: std.mem.Allocator,
++    d: *const cuda.Driver,
++    s: cuda.Stream,
++    target: *const wts.Weights,
++    tk: *const mm.Kernels,
++    k: Kernels,
++    context: usize,
++    vocab: usize, // the unpadded vocabulary: the target head's rows
++    layers: [layers_n]Layer = undefined,
++    fc: Lane = undefined,
++    hidden_norm: u64 = 0,
++    norm: u64 = 0,
++    selector: Lane = undefined,
++    pred: u64 = 0,
++    succ: u64 = 0,
++    mask: u64 = 0, // bf16 [H]: embed_norm(embed[mask_token])
++    head: ?Lane = null, // an FP8 copy of the target's unembedding, for draft logits alone
++    keys: u64 = 0,
++    // scratch, one hold or one absorb pass at a time on the target's stream
++    fused: u64 = 0,
++    c: u64 = 0,
++    kv: u64 = 0,
++    x: u64 = 0,
++    xc: u64 = 0,
++    resid: u64 = 0,
++    next_resid: u64 = 0,
++    y: u64 = 0,
++    yc: u64 = 0,
++    dyn: u64 = 0,
++    anchor: u64 = 0,
++    qkv: u64 = 0,
++    q: u64 = 0,
++    att: u64 = 0,
++    gu: u64 = 0,
++    act: u64 = 0,
++    base: u64 = 0,
++    hid: u64 = 0,
++    top: u64 = 0,
++    po: u64 = 0,
++    pml: u64 = 0,
++    part: u64 = 0,
++    buffers: std.ArrayList(DeviceBuffer) = .empty,
++    slots: std.ArrayList(Slot) = .empty,
++    slot_bufs: std.ArrayList(DeviceBuffer) = .empty,
++    lanes: std.AutoHashMapUnmanaged(*Stream, LaneState) = .empty,
++    trace: struct { ms: [max_batch + 1]f64 = @splat(0), n: [max_batch + 1]u64 = @splat(0), calls: u64 = 0 } = .{},
++
++    fn alloc(x: *Drafter, bytes: usize) !u64 {
++        var b = try DeviceBuffer.alloc(x.d, @max(bytes, 256));
++        errdefer b.free();
++        try x.buffers.append(x.gpa, b);
++        return b.ptr;
++    }
++
++    fn upload(x: *Drafter, bytes: []const u8) !u64 {
++        var b = try DeviceBuffer.fromHost(x.d, bytes);
++        errdefer b.free();
++        try x.buffers.append(x.gpa, b);
++        return b.ptr;
++    }
++
++    /// Rows of `parts` stacked as one [sum n][k] weight, packed for the qmmf bf16 lane.
++    fn pack(x: *Drafter, parts: []const core.checkpoint.Tensor) !Lane {
++        const k = parts[0].dim(1);
++        var n: usize = 0;
++        for (parts) |p| n += p.dim(0);
++        const src = try x.gpa.alloc(u16, n * k);
++        defer x.gpa.free(src);
++        var at: usize = 0;
++        for (parts) |p| {
++            @memcpy(std.mem.sliceAsBytes(src[at..][0 .. p.dim(0) * k]), p.bytes[0 .. p.dim(0) * k * 2]);
++            at += p.dim(0) * k;
++        }
++        const out = try x.gpa.alloc(u16, cuda.modelopt.padded(n) * k);
++        defer x.gpa.free(out);
++        @memset(out, 0);
++        cuda.qmmf.packBf16(out, src, n, k);
++        return cuda.modelopt.bf16Weight(try x.upload(std.mem.sliceAsBytes(out)), n, k);
++    }
++
++    /// A bf16 lane weight as a per-tensor FP8 lane weight (e4m3 at amax / 448), repacked on the GPU; the bf16 copy is
++    /// freed unless it is the target's.
++    fn fp8Of(x: *Drafter, u: Lane) !Lane {
++        const total: usize = @as(usize, u.npad) * u.k;
++        const amax = try x.alloc(4);
++        try x.d.check(x.d.api.cuMemsetD8Async(amax, 0, 4, x.s.handle), "cuMemsetD8Async");
++        var a: cuda.Args = .{};
++        a.add(u.codes);
++        a.add(@as(i64, @intCast(total)));
++        a.add(amax);
++        try go(x.k.amax, x.s, .{ .x = 1024 }, 256, &a);
++        try x.s.synchronize();
++        var bits: u32 = 0;
++        try cuda.memory.download(x.d, amax, std.mem.asBytes(&bits));
++        const m: f32 = @bitCast(bits);
++        if (!(m > 0) or !std.math.isFinite(m)) return error.DFlash2TensorShape;
++        const scale = m / 448.0;
++        const codes = try x.alloc(total);
++        var b: cuda.Args = .{};
++        b.add(u.codes);
++        b.add(codes);
++        b.add(@as(i32, @intCast(u.k)));
++        b.add(@as(f32, 1.0 / scale));
++        b.add(@as(i64, @intCast(total)));
++        try go(x.k.fp8_lane, x.s, .{ .x = @intCast((total + 255) / 256) }, 256, &b);
++        try x.s.synchronize();
++        for (x.buffers.items, 0..) |*held, i| if (held.ptr == u.codes) {
++            held.free();
++            _ = x.buffers.swapRemove(i);
++            break;
++        };
++        return cuda.modelopt.fp8Weight(codes, scale, u.n, u.k);
++    }
++
++    pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Stream, target: *const wts.Weights, tk: *const mm.Kernels, context: usize, dir: []const u8) !*Drafter {
++        const text = try readConfig(gpa, io, dir);
++        defer gpa.free(text);
++        try admitConfig(gpa, text);
++        if (target.config.text.hidden != hidden or target.config.text.unpadded_vocab <= mask_token or target.config.text.unpadded_vocab > codebook_vocab) return refuse("target");
++        const x = try gpa.create(Drafter);
++        errdefer gpa.destroy(x);
++        x.* = .{ .gpa = gpa, .d = d, .s = s, .target = target, .tk = tk, .k = try Kernels.load(d), .context = context, .vocab = target.config.text.unpadded_vocab };
++        errdefer x.deinit2();
++        var ck: core.checkpoint.Checkpoint = .{ .gpa = gpa, .io = io };
++        defer ck.close();
++        ck.add(dir, "model.safetensors") catch |e| {
++            std.log.err("Inkling 2 Mini DFlash2: cannot open {s}/model.safetensors ({s})", .{ dir, @errorName(e) });
++            return error.DFlash2MissingTensor;
++        };
++        try x.loadWeights(&ck);
++        if (on("TF_INKLING2_DRAFT_LAYERS8")) for (&x.layers) |*l| {
++            l.qkv = try x.fp8Of(l.qkv);
++            l.o = try x.fp8Of(l.o);
++            l.gu = try x.fp8Of(l.gu);
++            l.down = try x.fp8Of(l.down);
++        };
++        if (on("TF_INKLING2_DRAFT_FP8")) x.head = try x.fp8Of(target.unembed);
++        try x.scratch();
++        // the mask rows' input: the target's embedding of the mask token, normed as the target norms its own
++        x.mask = try x.alloc(hidden * 2);
++        const ids = [1]i32{mask_token};
++        const id = try x.upload(std.mem.sliceAsBytes(&ids));
++        try ops.embed(&x.tk.ops, x.s, id, 1, target.embed, target.embed_norm, x.mask, hidden, target.config.text.eps);
++        try x.s.synchronize();
++        return x;
++    }
++
++    fn get(ck: *core.checkpoint.Checkpoint, name: []const u8, shape: []const usize) !core.checkpoint.Tensor {
++        const t = ck.get(name) catch {
++            std.log.err("Inkling 2 Mini DFlash2: model.safetensors has no {s}", .{name});
++            return error.DFlash2MissingTensor;
++        };
++        if (!t.is(.bf16, shape)) {
++            std.log.err("Inkling 2 Mini DFlash2: {s} is not bf16 of the expected shape", .{name});
++            return error.DFlash2TensorShape;
++        }
++        return t;
++    }
++
++    fn of(ck: *core.checkpoint.Checkpoint, i: usize, suffix: []const u8, shape: []const usize) !core.checkpoint.Tensor {
++        var b: [96]u8 = undefined;
++        return get(ck, try std.fmt.bufPrint(&b, "layers.{d}.{s}", .{ i, suffix }), shape);
++    }
++
++    fn conv(x: *Drafter, ck: *core.checkpoint.Checkpoint, i: usize, comptime name: []const u8) !Conv {
++        return .{
++            .proj = try x.pack(&.{try of(ck, i, name ++ ".kernel_projection.weight", &.{ dyn_width, hidden })}),
++            .base = try x.upload((try of(ck, i, name ++ ".base_kernel", &.{ 2, 2, hidden })).bytes),
++        };
++    }
++
++    fn loadWeights(x: *Drafter, ck: *core.checkpoint.Checkpoint) !void {
++        const H = hidden;
++        for (&x.layers, 0..) |*l, i| {
++            const q = try of(ck, i, "self_attn.q_proj.weight", &.{ q_width, H });
++            const k = try of(ck, i, "self_attn.k_proj.weight", &.{ kv_width, H });
++            const v = try of(ck, i, "self_attn.v_proj.weight", &.{ kv_width, H });
++            l.qkv = try x.pack(&.{ q, k, v });
++            l.ctx = try x.pack(&.{ k, v });
++            l.o = try x.pack(&.{try of(ck, i, "self_attn.o_proj.weight", &.{ H, q_width })});
++            l.gu = try x.pack(&.{ try of(ck, i, "mlp.gate_proj.weight", &.{ inter, H }), try of(ck, i, "mlp.up_proj.weight", &.{ inter, H }) });
++            l.down = try x.pack(&.{try of(ck, i, "mlp.down_proj.weight", &.{ H, inter })});
++            l.aconv = try x.conv(ck, i, "attention_conv");
++            l.mconv = try x.conv(ck, i, "mlp_conv");
++            l.input_norm = try x.upload((try of(ck, i, "input_layernorm.weight", &.{H})).bytes);
++            l.post_norm = try x.upload((try of(ck, i, "post_attention_layernorm.weight", &.{H})).bytes);
++            l.q_norm = try x.upload((try of(ck, i, "self_attn.q_norm.weight", &.{head_dim})).bytes);
++            l.k_norm = try x.upload((try of(ck, i, "self_attn.k_norm.weight", &.{head_dim})).bytes);
++            ck.release();
++        }
++        x.fc = try x.pack(&.{try get(ck, "fc.weight", &.{ H, taps.len * H })});
++        x.hidden_norm = try x.upload((try get(ck, "hidden_norm.weight", &.{H})).bytes);
++        x.norm = try x.upload((try get(ck, "norm.weight", &.{H})).bytes);
++        x.selector = try x.pack(&.{try get(ck, "candidate_selector.hidden_projection.weight", &.{ rank, H })});
++        x.pred = try x.upload((try get(ck, "candidate_selector.predecessor_codebook", &.{ codebook_vocab, rank })).bytes);
++        x.succ = try x.upload((try get(ck, "candidate_selector.successor_codebook", &.{ codebook_vocab, rank })).bytes);
++        ck.release();
++    }
++
++    fn scratch(x: *Drafter) !void {
++        const H = hidden;
++        const B = max_batch * block;
++        x.fused = try x.alloc(keep_rows * H * 2);
++        x.c = try x.alloc(keep_rows * H * 2);
++        x.kv = try x.alloc(keep_rows * 2 * kv_width * 2);
++        inline for (.{ "x", "xc", "resid", "next_resid", "y", "yc" }) |f| @field(x, f) = try x.alloc(B * H * 2);
++        x.dyn = try x.alloc(B * dyn_width * 2);
++        x.anchor = try x.alloc(max_batch * H * 2);
++        x.qkv = try x.alloc(B * (q_width + 2 * kv_width) * 2);
++        x.q = try x.alloc(B * q_width * 2);
++        x.att = try x.alloc(B * q_width * 2);
++        x.gu = try x.alloc(B * 2 * inter * 2);
++        x.act = try x.alloc(B * inter * 2);
++        x.base = try x.alloc(B * x.vocab * 2);
++        x.hid = try x.alloc(B * rank * 2);
++        x.top = try x.alloc(max_batch * depth * 2 * top_k * 4);
++        x.keys = try x.alloc(max_batch * @sizeOf(DraftKey));
++        const chunks = (window + block) / chunk + 2;
++        x.po = try x.alloc(chunks * block * heads * head_dim * 4);
++        x.pml = try x.alloc(chunks * block * heads * 2 * 4);
++        var part: usize = 0;
++        for (x.layers) |l| {
++            for ([_]Lane{ l.qkv, l.o, l.gu, l.down, l.aconv.proj, l.mconv.proj, x.selector, x.draftHead() }) |w| for (1..max_batch + 1) |nb| {
++                part = @max(part, x.tk.lane.partBytes(nb * block, w));
++            };
++            for (1..keep_rows + 1) |m| part = @max(part, x.tk.lane.partBytes(m, l.ctx));
++        }
++        for (1..keep_rows + 1) |m| part = @max(part, x.tk.lane.partBytes(m, x.fc));
++        x.part = try x.alloc(part);
++    }
++
++    fn draftHead(x: *const Drafter) Lane {
++        return x.head orelse x.target.unembed;
++    }
++
++    fn deinit2(x: *Drafter) void {
++        x.lanes.deinit(x.gpa);
++        for (x.slot_bufs.items) |*b| b.free();
++        x.slot_bufs.deinit(x.gpa);
++        x.slots.deinit(x.gpa);
++        for (x.buffers.items) |*b| b.free();
++        x.buffers.deinit(x.gpa);
++        x.k.mod.unload();
++        x.k.mtp.unload();
++    }
++
++    pub fn deinit(x: *Drafter) void {
++        x.deinit2();
++        x.gpa.destroy(x);
++    }
++
++    /// Device bytes besides the streams': weights, the FP8 head and the scratch.
++    pub fn fixedBytes(x: *const Drafter) usize {
++        var n: usize = 0;
++        for (x.buffers.items) |b| n += b.len;
++        return n;
++    }
++
++    /// `streams` slots' rings, allocated now (the host's count); a smaller count than held keeps them.
++    pub fn reserve(x: *Drafter, streams: u32) !void {
++        while (x.slots.items.len < streams) {
++            var sl: Slot = .{ .k = undefined, .v = undefined, .walk = 0 };
++            for (0..layers_n) |i| {
++                sl.k[i] = try x.slotAlloc(ring * kv_width * 2);
++                sl.v[i] = try x.slotAlloc(ring * kv_width * 2);
++            }
++            sl.walk = try x.slotAlloc(block * 4);
++            try x.slots.append(x.gpa, sl);
++        }
++    }
++
++    fn slotAlloc(x: *Drafter, bytes: usize) !u64 {
++        var b = try DeviceBuffer.alloc(x.d, bytes);
++        errdefer b.free();
++        try x.slot_bufs.append(x.gpa, b);
++        return b.ptr;
++    }
++
++    pub fn drafter(x: *Drafter) dr.Drafter {
++        return .{ .kind = "DFlash2", .ptr = x, .vtable = &.{ .taps = tapsFn, .facts = factsFn, .open = openFn, .absorb = absorbFn, .hold = holdFn, .held = heldFn, .release = releaseFn } };
++    }
++
++    fn self(ptr: *anyopaque) *Drafter {
++        return @ptrCast(@alignCast(ptr));
++    }
++
++    fn tapsFn(_: *anyopaque) []const u32 {
++        return &taps;
++    }
++
++    fn factsFn(_: *anyopaque) dr.Facts {
++        return .{ .depth = depth, .step_ms = 0, .fixed_block = true, .plain_guard = true, .batched = true, .prior = &prior, .stream_bytes = laneBytes(), .window_costs = &window_costs, .hold_costs = if (on("TF_INKLING2_HOLD_COSTS")) &hold_costs else &.{} };
++    }
++
++    fn openFn(ptr: *anyopaque, s: *Stream) anyerror!void {
++        const x = self(ptr);
++        if (x.lanes.contains(s)) return error.DraftStreamOpen;
++        const slot = for (x.slots.items, 0..) |sl, i| {
++            if (!sl.used) break i;
++        } else blk: {
++            try x.reserve(@intCast(x.slots.items.len + 1)); // past the host's count: one more, if it fits
++            break :blk x.slots.items.len - 1;
++        };
++        try x.lanes.put(x.gpa, s, .{ .slot = slot });
++        x.slots.items[slot].used = true;
++    }
++
++    fn releaseFn(ptr: *anyopaque, s: *Stream) void {
++        const x = self(ptr);
++        if (x.lanes.fetchRemove(s)) |e| x.slots.items[e.value.slot].used = false;
++    }
++
++    fn heldFn(ptr: *anyopaque, streams: []const *Stream, out: []const []u32) anyerror!void {
++        const x = self(ptr);
++        try x.s.synchronize();
++        for (streams, out) |s, toks| {
++            const l = x.lanes.getPtr(s) orelse return error.DraftStreamUnknown;
++            if (toks.len > l.held) return error.DraftHeldFewer;
++            var steps: [block]i32 = undefined;
++            try cuda.memory.download(x.d, x.slots.items[l.slot].walk, std.mem.sliceAsBytes(&steps));
++            for (toks, steps[1..][0..toks.len]) |*t, w| {
++                if (w < 0 or w >= x.vocab) return error.DraftNonfinite;
++                t.* = @intCast(w);
++            }
++        }
++    }
++
++    fn mul(x: *Drafter, in: u64, ld: usize, rows: usize, w: Lane, out: u64) !void {
++        try x.tk.lane.matmulOut(x.s, in, ld, rows, w, out, .bf16, x.part);
++    }
++
++    fn resnorm(x: *Drafter, in: u64, resid: u64, w: u64, new_resid: u64, out: u64, init_: bool, rows: usize) !void {
++        var a: cuda.Args = .{};
++        for ([_]u64{ in, resid, w, new_resid, out }) |v| a.add(v);
++        a.add(@as(i32, hidden));
++        a.add(@as(i32, @intFromBool(init_)));
++        a.add(eps);
++        try go(x.k.resnorm, x.s, .{ .x = @intCast(rows) }, 256, &a);
++    }
++
++    /// Rows [start, start + rows) of `features` (device bf16 [rows][4][H]) into the stream's five rings.
++    fn absorbRows(x: *Drafter, sl: *const Slot, features: u64, start: u64, rows: usize) !void {
++        const H = hidden;
++        try x.mul(features, taps.len * H, rows, x.fc, x.fused);
++        try x.resnorm(x.fused, 0, x.hidden_norm, x.fused, x.c, true, rows);
++        for (x.layers, 0..) |l, i| {
++            try x.mul(x.c, H, rows, l.ctx, x.kv);
++            var b: cuda.Args = .{};
++            for ([_]u64{ x.kv, x.kv + kv_width * 2 }) |v| b.add(v);
++            b.add(@as(i32, 2 * kv_width));
++            for ([_]u64{ l.k_norm, sl.k[i], sl.v[i] }) |v| b.add(v);
++            b.add(@as(i32, kv_width));
++            b.add(@as(i32, @intCast(start)));
++            b.add(@as(i32, ring));
++            b.add(eps);
++            b.add(theta);
++            try go(x.k.ctx_kv, x.s, .{ .x = @intCast(rows), .y = kv_heads }, head_dim, &b);
++        }
++    }
++
++    fn absorbFn(ptr: *anyopaque, items: []const dr.Absorb) anyerror!void {
++        const x = self(ptr);
++        for (items) |item| {
++            const l = x.lanes.getPtr(item.stream) orelse return error.DraftStreamUnknown;
++            const f = item.features;
++            if (f.space != .device or f.dtype != .bf16 or f.row_bytes != row_bytes) return error.DraftFeaturesUnsupported;
++            if (item.rows != null) return error.TreesNotBuilt;
++            if (f.rows == 0) continue;
++            const end = item.start + f.rows;
++            if (end > x.context) return error.DraftContextGap;
++            // a gap (a resumed prompt) or a rewind past the rings: attend from here
++            if (item.start > l.end or item.start < l.from or l.end == 0) l.from = item.start;
++            // rows no block will read: all but this chunk's last keep_rows, and those far before a prompt's end
++            var first = @max(item.start, end -| keep_rows);
++            if (item.prompt) first = @min(end, @max(first, @as(u64, item.stream.prompt_len) -| keep_rows));
++            if (first > item.start) l.from = @max(l.from, first);
++            if (first < end) try x.absorbRows(&x.slots.items[l.slot], f.buffer + f.offset + @as(usize, @intCast(first - item.start)) * row_bytes, first, @intCast(end - first));
++            l.end = end; // rows past a rewound end are rewritten in place
++            l.held = 0;
++        }
++    }
++
++    fn convolve(x: *Drafter, in: u64, c: Conv, side: i32, out: u64, rows: usize) !void {
++        var a: cuda.Args = .{};
++        for ([_]u64{ in, x.dyn, c.base, out }) |v| a.add(v);
++        a.add(@as(i32, hidden));
++        a.add(@as(i32, conv_group));
++        a.add(side);
++        try go(x.k.conv, x.s, .{ .x = @intCast(rows) }, 256, &a);
++    }
++
++    /// The blocks of `bi` through the five layers: matmuls over all their rows at once, attention a stream; then the
++    /// head's top 16, the selector's hidden rows and each stream's walk.
++    fn encode(x: *Drafter, bi: []const Item) !void {
++        const H = hidden;
++        const N = bi.len;
++        const rows = N * block;
++        const ld = q_width + 2 * kv_width;
++        for (bi, 0..) |b, s| {
++            try ops.embed(&x.tk.ops, x.s, b.sl.walk, 1, x.target.embed, x.target.embed_norm, x.anchor + s * H * 2, H, x.target.config.text.eps);
++            var a: cuda.Args = .{};
++            for ([_]u64{ x.anchor + s * H * 2, x.mask, x.x + s * block * H * 2 }) |v| a.add(v);
++            a.add(@as(i32, H));
++            try go(x.k.init_rows, x.s, .{ .x = block }, 256, &a);
++        }
++        try x.resnorm(x.x, x.resid, x.layers[0].input_norm, x.resid, x.x, true, rows);
++        for (x.layers, 0..) |ly, i| {
++            try x.mul(x.x, H, rows, ly.aconv.proj, x.dyn);
++            try x.convolve(x.x, ly.aconv, 0, x.xc, rows);
++            try x.mul(x.xc, H, rows, ly.qkv, x.qkv);
++            for (bi, 0..) |b, s| {
++                const hi: usize = @intCast(b.anchor + block - 1);
++                var c: cuda.Args = .{};
++                c.add(x.qkv + s * block * ld * 2);
++                c.add(@as(i32, ld));
++                for ([_]u64{ ly.q_norm, ly.k_norm, x.q + s * block * q_width * 2, b.sl.k[i], b.sl.v[i] }) |v| c.add(v);
++                c.add(@as(i32, heads));
++                c.add(@as(i32, kv_heads));
++                c.add(@as(i32, @intCast(b.anchor)));
++                c.add(@as(i32, ring));
++                c.add(eps);
++                c.add(theta);
++                try go(x.k.block_qkv, x.s, .{ .x = block, .y = heads + kv_heads }, head_dim, &c);
++                const lo: usize = @intCast(@max(b.l.from, (b.anchor + 1) -| window));
++                const c0 = lo / chunk;
++                const nc = hi / chunk - c0 + 1;
++                var e: cuda.Args = .{};
++                e.add(AttnArgs{ .q = x.q + s * block * q_width * 2, .kc = b.sl.k[i], .vc = b.sl.v[i], .po = x.po, .pml = x.pml, .T = block, .hq = heads, .hk = kv_heads, .ring = ring, .lo = @intCast(lo), .hi = @intCast(hi), .c0 = @intCast(c0), .window = window, .scale = 1.0 / @sqrt(@as(f32, head_dim)) });
++                try go(x.k.attn, x.s, .{ .x = @intCast(nc), .y = kv_heads }, 256, &e);
++                var m: cuda.Args = .{};
++                for ([_]u64{ x.po, x.pml }) |v| m.add(v);
++                m.add(@as(i32, @intCast(nc)));
++                m.add(@as(i32, block * heads));
++                m.add(x.att + s * block * q_width * 2);
++                try go(x.k.merge, x.s, .{ .x = block * heads }, head_dim, &m);
++            }
++            try x.mul(x.att, q_width, rows, ly.o, x.y);
++            try x.convolve(x.y, ly.aconv, 1, x.yc, rows);
++            try x.resnorm(x.yc, x.resid, ly.post_norm, x.next_resid, x.x, false, rows);
++            try x.mul(x.x, H, rows, ly.mconv.proj, x.dyn);
++            try x.convolve(x.x, ly.mconv, 0, x.xc, rows);
++            try x.mul(x.xc, H, rows, ly.gu, x.gu);
++            var g: cuda.Args = .{};
++            for ([_]u64{ x.gu, x.gu + inter * 2 }) |v| g.add(v);
++            g.add(@as(i32, 2 * inter));
++            g.add(x.act);
++            g.add(@as(i32, inter));
++            try go(x.k.swiglu, x.s, .{ .x = (inter + 255) / 256, .y = @intCast(rows) }, 256, &g);
++            try x.mul(x.act, inter, rows, ly.down, x.y);
++            try x.convolve(x.y, ly.mconv, 1, x.yc, rows);
++            const next = if (i + 1 < x.layers.len) x.layers[i + 1].input_norm else x.norm;
++            try x.resnorm(x.yc, x.next_resid, next, x.resid, x.x, false, rows);
++        }
++        try x.mul(x.x, H, rows, x.draftHead(), x.base);
++        try x.mul(x.x, H, rows, x.selector, x.hid);
++        var t: cuda.Args = .{};
++        t.add(x.base);
++        t.add(@as(i32, @intCast(x.vocab)));
++        t.add(x.top);
++        try go(x.k.topk, x.s, .{ .x = @intCast(N * depth) }, 256, &t);
++    }
++
++    fn select(x: *Drafter, bi: []const Item, items: []const dr.Hold) !void {
++        var keys: [max_batch]DraftKey = @splat(.{ .seed = 0, .inv_t = 0, .pos = 0 });
++        var keyed = false;
++        if (on("TF_INKLING2_DRAFT_KEYED")) for (items, 0..) |it, i| if (cuda.sample.ruleFor(it.sampling)) |r| {
++            keys[i] = .{ .seed = r.seed, .inv_t = r.inv_t, .pos = @intCast(it.position) };
++            keyed = true;
++        };
++        if (keyed) try cuda.copy_source.enqueue(x.d, x.keys, std.mem.sliceAsBytes(keys[0..items.len]), x.s);
++        for (bi, 0..) |b, s| {
++            var a: cuda.Args = .{};
++            for ([_]u64{ x.top + s * depth * 2 * top_k * 4, x.hid + s * block * rank * 2 }) |v| a.add(v);
++            a.add(@as(i32, rank));
++            for ([_]u64{ x.pred, x.succ }) |v| a.add(v);
++            a.add(cap);
++            a.add(@as(i32, @intCast(b.n)));
++            a.add(if (keyed) x.keys + s * @sizeOf(DraftKey) else @as(u64, 0));
++            a.add(b.sl.walk);
++            try go(x.k.walk, x.s, .{ .x = 1 }, 512, &a);
++        }
++    }
++
++    fn holdGroup(x: *Drafter, items: []const dr.Hold) !void {
++        var bi: [max_batch]Item = undefined;
++        for (items, 0..) |item, b| {
++            const l = x.lanes.getPtr(item.stream) orelse return error.DraftStreamUnknown;
++            if (item.lanes != null) return error.TreesNotBuilt;
++            if (item.depth == 0 or item.position == 0) return error.DraftDepth;
++            const anchor = item.position - 1;
++            if (l.end != anchor) return error.DraftContextGap;
++            const sl = &x.slots.items[l.slot];
++            const pending = [1]i32{@intCast(item.pending)};
++            try cuda.copy_source.enqueue(x.d, sl.walk, std.mem.sliceAsBytes(&pending), x.s);
++            bi[b] = .{ .l = l, .sl = sl, .anchor = anchor, .n = @min(item.depth, depth) };
++        }
++        try x.encode(bi[0..items.len]);
++        try x.select(bi[0..items.len], items);
++        for (bi[0..items.len]) |b| b.l.held = @intCast(b.n);
++    }
++
++    fn holdFn(ptr: *anyopaque, items: []const dr.Hold) anyerror!void {
++        const x = self(ptr);
++        const traced = std.c.getenv("TF_INKLING2_DRAFT_TRACE") != null;
++        var i: usize = 0;
++        while (i < items.len) : (i += max_batch) {
++            const group = items[i..@min(items.len, i + max_batch)];
++            if (!traced) {
++                try x.holdGroup(group);
++                continue;
++            }
++            try x.s.synchronize();
++            const t0 = now();
++            try x.holdGroup(group);
++            try x.s.synchronize();
++            x.trace.ms[group.len] += now() - t0;
++            x.trace.n[group.len] += 1;
++            x.trace.calls += 1;
++            if (x.trace.calls % 200 == 0) for (1..max_batch + 1) |n| if (x.trace.n[n] > 0) std.debug.print("[dflash2 holds] size {d}: {d:.2} ms avg over {d}\n", .{ n, x.trace.ms[n] / @as(f64, @floatFromInt(x.trace.n[n])), x.trace.n[n] });
++        }
++    }
++};
++
++fn now() f64 {
++    var t: std.c.timespec = undefined;
++    _ = std.c.clock_gettime(.MONOTONIC, &t);
++    return @as(f64, @floatFromInt(t.sec)) * 1e3 + @as(f64, @floatFromInt(t.nsec)) / 1e6;
++}
++
++fn go(f: cuda.Function, s: cuda.Stream, grid: cuda.Dim3, threads: u32, a: *cuda.Args) !void {
++    try cuda.launch.launch(f, .{ .grid = grid, .block = .{ .x = threads } }, s, a);
++}
++
++test "the rings hold the window and a block, and one absorb pass never writes a slot twice" {
++    try std.testing.expectEqual(@as(usize, 2176), ring);
++    try std.testing.expect(keep_rows <= ring);
++    try std.testing.expectEqual(@as(usize, 5 * 2 * 2176 * 1024 * 2 + 256), laneBytes());
++    try std.testing.expectEqual(@as(usize, 576), dyn_width);
++}
++
++test "the released drafter's config is taken, a changed one refused" {
++    const gpa = std.testing.allocator;
++    const text =
++        \\{"architectures":["DFlash2DraftModel"],"hidden_size":2304,"num_hidden_layers":5,"num_attention_heads":32,
++        \\"num_key_value_heads":8,"head_dim":128,"intermediate_size":6912,"sliding_window":2048,"vocab_size":201024,
++        \\"rms_norm_eps":1e-06,"is_causal":false,"rope_parameters":{"rope_theta":10000.0,"rope_type":"default"},
++        \\"layer_types":["sliding_attention","sliding_attention","sliding_attention","sliding_attention","sliding_attention"],
++        \\"dflash_config":{"block_size":8,"conv_group_size":16,"conv_kernel_size":2,"final_logit_softcapping":30.0,
++        \\"mask_token_id":200056,"selector_rank":256,"selector_softcap_mode":"after_correction","selector_top_k":16,
++        \\"target_layer_ids":[5,23,41,48]}}
++    ;
++    try admitConfig(gpa, text);
++    const bad = try std.mem.replaceOwned(u8, gpa, text, "[5,23,41,48]", "[6,24,42,49]");
++    defer gpa.free(bad);
++    try std.testing.expectError(error.DFlash2Config, admitConfig(gpa, bad));
++}
+diff --git a/zig/src/families/inkling2/mini_native.zig b/zig/src/families/inkling2/mini_native.zig
+index 7b1f0b5..01665bc 100644
+--- a/zig/src/families/inkling2/mini_native.zig
++++ b/zig/src/families/inkling2/mini_native.zig
+@@ -9,6 +9,7 @@ const mm = @import("mini_model.zig");
+ const be = @import("mini_backend.zig");
+ const snap = @import("mini_snap.zig");
+ const dspark = @import("mini_dspark.zig");
++const dflash2 = @import("mini_dflash2.zig");
+ const mini_vision = @import("mini_vision.zig");
+ 
+ pub const model_type = "inkling2_loop";
+@@ -126,6 +127,11 @@ pub fn openDrafter(gpa: std.mem.Allocator, io: std.Io, p: *anyopaque, dir: []con
+     if (bits != 0 and bits != 4) return error.DSparkBits;
+     const own: *Owned = @ptrCast(@alignCast(p));
+     if (own.b.lanes.count() != 0) return error.TapsAfterStreams;
++    if (try dflash2.isDFlash2(gpa, io, dir)) {
++        const f = try dflash2.Drafter.init(gpa, io, own.m.d, own.s, &own.w, &own.k, own.m.context, dir);
++        std.log.info("Inkling 2 Mini DFlash2: {d} drafts a block from {s}, {d:.2} GiB fixed, {d:.3} GiB a stream", .{ dflash2.depth, dir, gib(f.fixedBytes()), gib(dflash2.laneBytes()) });
++        return .{ .drafter = f.drafter(), .ctx = f, .close = closeDFlash2, .reserve = reserveDFlash2 };
++    }
+     const d = try dspark.Drafter.init(gpa, io, own.m.d, own.s, &own.w, &own.k, own.m.context, dir);
+     std.log.info("Inkling 2 Mini DSpark: {d} drafts a block from {s}, bf16 weights (--drafter-bits {d} serves bf16), {d:.2} GiB fixed, {d:.2} GiB a stream", .{ dspark.depth, dir, bits, gib(d.fixedBytes()), gib(dspark.laneBytes(own.m.context)) });
+     return .{ .drafter = d.drafter(), .ctx = d, .close = closeDrafter, .reserve = reserveDrafter };
+@@ -136,6 +142,16 @@ fn closeDrafter(p: *anyopaque) void {
+     d.deinit();
+ }
+ 
++fn closeDFlash2(p: *anyopaque) void {
++    const d: *dflash2.Drafter = @ptrCast(@alignCast(p));
++    d.deinit();
++}
++
++fn reserveDFlash2(p: *anyopaque, streams: u32) anyerror!void {
++    const d: *dflash2.Drafter = @ptrCast(@alignCast(p));
++    try d.reserve(streams);
++}
++
+ fn reserveDrafter(p: *anyopaque, streams: u32) anyerror!void {
+     const d: *dspark.Drafter = @ptrCast(@alignCast(p));
+     try d.reserve(streams);
+@@ -198,6 +214,8 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
+         error.DSparkMissingFile => "--drafter: no mtp.safetensors in that folder; name the checkpoint folder or the .safetensors file",
+         error.DSparkMissingTensor, error.DSparkTensorShape => "--drafter: that mtp.safetensors is not Inkling 2 Mini's DSpark head (the log names the tensor)",
+         error.DSparkNotConfigured, error.UnsupportedDSparkConfig => "--drafter: the checkpoint's mtp_config is not the DSpark head this engine serves (3 layers, block 8, rank 256, taps 5/23/41/48)",
++        error.DFlash2Config => "--drafter: that config.json is not the DFlash2 drafter this engine serves (the log names the field)",
++        error.DFlash2MissingTensor, error.DFlash2TensorShape => "--drafter: that model.safetensors is not Inkling 2 Mini's DFlash2 drafter (the log names the tensor)",
+         error.TapsAfterStreams => "the DSpark drafter attaches before any stream opens",
+         error.StructuresUnsupported => "structured output is not built for Inkling 2 Mini on CUDA yet",
+         error.NoAllowedToken => "structured output: the grammar allowed no token with a usable score at this step",

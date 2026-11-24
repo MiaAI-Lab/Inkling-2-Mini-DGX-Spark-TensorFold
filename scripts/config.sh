@@ -80,6 +80,12 @@ PARALLEL="${PARALLEL:-8}"
 MAX_TOKENS="${MAX_TOKENS:-32768}"
 # DRAFTS=1 loads the checkpoint's own DSpark drafter (mtp.safetensors) with --drafter; 0 passes --no-drafts.
 DRAFTS="${DRAFTS:-1}"
+# DRAFTER=dflash2 drafts with incoai/Inkling-2-Mini-DFlash2 (patch 0018) from DFLASH2_DIR instead of DSpark:
+#   hf download incoai/Inkling-2-Mini-DFlash2 config.json model.safetensors --revision 4f9088ea66c21f2b99ed657d1941c306b03e84d2
+DRAFTER="${DRAFTER:-dspark}"
+DFLASH2_DIR="${DFLASH2_DIR:-$HOME/models/hf/Inkling-2-Mini-DFlash2}"
+DFLASH2_MOUNT=/models/dflash2
+DFLASH2_SHA256="${DFLASH2_SHA256:-217980ab00d116693fa5946df7bbfd967caf5fac1f529afd541fbd470ddb54ee}"
 # VISION=1 loads the checkpoint's inkling2_vision tower (--vision, ~0.6 GiB of bf16 weights) for image inputs (PNG,
 # JPEG, WebP). VISION_URLS=1 also lets image_url fetch http(s) URLs (data: URLs always work). VISION_MAX_IMAGES and
 # VISION_IMAGE_TOKENS (an image's token budget, engine default 4096) are passed when set.
@@ -116,12 +122,12 @@ if [[ "$RERISKED" == 1 ]]; then export TF_REASONING_FIELD="${TF_REASONING_FIELD:
 # One stream's cache at a CONTEXT-token window. Per token: the 8 full visits' K and V (bf16: 8 x 1024 x 2 x 2 = 32,768 bytes;
 # fp8: 8 x 2 x (1024 + 8 scales x 4) = 16,896 bytes); the 40 sliding visits keep fixed 1,536-row rings and 48 visits keep conv
 # states (~0.24 GiB together a stream). The engine reported 1.24 GiB a stream at 32,768 tokens, which this reproduces.
-# The drafter's global layer adds 4,096 bytes a token. PROVISIONAL.
+# DSpark's global layer adds 4,096 bytes a token; DFlash2's rings are fixed (0.04 GiB a stream). PROVISIONAL.
 kv_gib() {
   local ctx=${1:-$CONTEXT} per=32768
   [[ "$KV_DTYPE" == fp8 ]] && per=16896
   [[ "$ctx" =~ ^[0-9]+$ ]] || ctx=$CONTEXT
-  [[ "$DRAFTS" == 1 ]] && per=$((per + 4096))
+  [[ "$DRAFTS" == 1 && "$DRAFTER" == dspark ]] && per=$((per + 4096))
   echo $(( (per * ctx + 268435456 + 1073741823) / 1073741824 ))
 }
 # MemAvailable a start needs: weights, every stream's window, scratch slack and the floor. PROVISIONAL.

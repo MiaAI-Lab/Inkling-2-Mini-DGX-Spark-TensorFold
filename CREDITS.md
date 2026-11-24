@@ -29,6 +29,11 @@ License, Version 2.0 ([`LICENSE`](LICENSE)). The image `scripts/prepare.sh` buil
 - **gilby** ([gilby](https://github.com/gilby)): Mini's Metal kernels, DSpark prompt cache and snapshot fixes.
 - **akol1** ([akol1](https://github.com/akol1)): the plan for Inkling 2 Mini on CUDA and Metal in claimable slices
   ([#4274](https://github.com/ashhart/TensorFold/pull/4274)).
+- **DFlash2** (patch `0018`): the drafter and its SGLang reference by [Inco AI](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2)
+  (Apache-2.0; weights not part of this repository); the Inkling fixes to vLLM's DFlash2 by
+  [tonyd2wild](https://github.com/tonyd2wild/Inkling-2-Mini-NVFP4-DGX-Spark); the Metal drafter by cwschroeder
+  ([#4917](https://github.com/ashhart/TensorFold/pull/4917)); and TensorFold's Muse Spark and Qwen DFlash2 kernels, which its top-16, selector walk
+  and convolutions follow.
 - **[xgrammar](https://github.com/mlc-ai/xgrammar)** by the MLC-AI team (Apache-2.0): `libtfgrammar.so`, built from the patched tree over xgrammar
   v0.2.8 at its pinned commit (its license, NOTICE and dlpack's license ship in the image).
 - **[libjpeg-turbo](https://libjpeg-turbo.org)** 3.1.4.1 (IJG, BSD-3-Clause and zlib licenses) and **[libwebp](https://chromium.googlesource.com/webm/libwebp)**
