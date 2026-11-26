@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Serve Inkling-2-Mini (default; RERISKED=1 serves the local Inkling-2-Mini-Derisked folder) with TensorFold's Zig engine on one DGX Spark: runs
+# Serve Inkling-2-Mini (default; UNLEASHED=1 / QUANT=uncensored-nvfp4: local OpenUncensored; RERISKED=1: local Derisked) with TensorFold's Zig engine on one DGX Spark: runs
 # scripts/prepare.sh when the image or the checkpoint check is not current, launches tensorfold-native serve on port
 # 8888 with the DFlash2 draft model (incoai/Inkling-2-Mini-DFlash2; DRAFTER=dspark: the checkpoint's own DSpark head),
 # waits until the OpenAI API answers, then runs a smoke test.
@@ -11,6 +11,7 @@
 #   ./start.sh restart --parallel 2 --context 131072
 #   CONTEXT=131072 ./start.sh restart  # a shorter window leaves memory for more streams or the prompt cache
 #   DRAFTS=0 ./start.sh restart        # no drafter (--no-drafts)
+#   UNLEASHED=1 ./start.sh restart     # local OpenUncensored folder (same role as Qwen QUANT=uncensored-nvfp4)
 #   DRAFTER=dspark ./start.sh restart  # the checkpoint's own DSpark head instead of DFlash2
 #   VISION=0 ./start.sh restart        # text only: no vision tower (saves ~0.6 GiB)
 #   DRY_RUN=1 ./start.sh               # print the docker command and exit

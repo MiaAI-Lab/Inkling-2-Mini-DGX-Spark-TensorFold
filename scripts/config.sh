@@ -22,7 +22,53 @@ unset _line _key _value
 # (the hub's LFS SHA-256 upstream, the derivative README's otherwise); both share the byte-identical MTP module.
 RERISKED="${RERISKED:-${DERISKED:-0}}"
 [[ "$RERISKED" =~ ^[01]$ ]] || { echo "RERISKED is 0 or 1, not $RERISKED" >&2; exit 1; }
-if [[ "$RERISKED" == 1 ]]; then
+# UNABLITERATED=1 forces the stock thinkingmachines checkpoint (RERISKED=0).
+# UNABLITERATED=0 selects the local Derisked folder (RERISKED=1). Unset keeps RERISKED.
+# The two cannot disagree.
+UNABLITERATED="${UNABLITERATED:-}"
+if [[ -n "$UNABLITERATED" ]]; then
+  [[ "$UNABLITERATED" =~ ^[01]$ ]] || { echo "UNABLITERATED is 0 or 1, not $UNABLITERATED" >&2; exit 1; }
+  if [[ "$UNABLITERATED" == 1 && "$RERISKED" == 1 ]]; then
+    echo "UNABLITERATED=1 cannot be combined with RERISKED=1" >&2; exit 1
+  fi
+  if [[ "$UNABLITERATED" == 1 ]]; then
+    RERISKED=0
+  else
+    RERISKED=1
+  fi
+fi
+# UNLEASHED=1 is this recipe's copy of Qwen's QUANT=uncensored-nvfp4: the local
+# OpenUncensored folder, never the stock checkpoint and never Derisked.
+# QUANT=uncensored / uncensored-nvfp4 / unleashed in the environment or .env
+# selects it too, so the Qwen .env line works here. An explicit UNLEASHED=0
+# still wins, which is how the stock switch overrides a .env default.
+case "${QUANT:-}" in
+  uncensored|uncensored-nvfp4|unleashed) UNLEASHED="${UNLEASHED:-1}" ;;
+esac
+UNLEASHED="${UNLEASHED:-0}"
+[[ "$UNLEASHED" =~ ^[01]$ ]] || { echo "UNLEASHED is 0 or 1, not $UNLEASHED" >&2; exit 1; }
+# Explicit stock or Derisked beats UNLEASHED=1 from .env. The stock wrapper
+# passes UNLEASHED=0; a bare UNABLITERATED=1 ./start.sh does the same.
+if [[ "$UNABLITERATED" == 1 || "$RERISKED" == 1 ]]; then
+  if [[ "$UNLEASHED" == 1 ]]; then
+    echo "UNABLITERATED/RERISKED wins over UNLEASHED=1" >&2
+  fi
+  UNLEASHED=0
+fi
+if [[ "$UNLEASHED" == 1 ]]; then
+  MODEL_DIR="${MODEL_DIR:-$HOME/models/hf/Inkling-2-Mini-Unleashed}"
+  MODEL_LABEL="${MODEL_LABEL:-Inkling-2-Mini-Uncensored}"
+  # Served name is the HF repo id.
+  SERVED_NAME="${SERVED_NAME:-OpenUncensored/Inkling-2-Mini-Uncensored}"
+  # File SHA-256 of OpenUncensored/Inkling-2-Mini-Uncensored@4e5f06d7.
+  # MTP is byte-identical to upstream; the shard is not.
+  # orcarouter/Inkling-2-Mini-abliterated is not a valid pin: BF16, two shards,
+  # and tensorfold-native rejects it (ExpertFormat). No NVFP4 Orca file exists.
+  SHARD_SHA256="${SHARD_SHA256:-a841d90643aec49a9dd07968ee96a26fe0a9d829d0f27901ebb5cb3938c99227}"
+  MTP_SHA256="${MTP_SHA256:-7c3b651317f01f73bcf4e1dceba66ef8b7e1a1eac6bc171e882e690a4b10a1d2}"
+  MODEL_FETCH=0
+  RERISKED=0
+elif [[ "$RERISKED" == 1 ]]; then
   MODEL_DIR="${MODEL_DIR:-$HOME/models/hf/Inkling-2-Mini-Derisked}"
   MODEL_LABEL="${MODEL_LABEL:-Inkling-2-Mini-Derisked}"
   SHARD_SHA256="${SHARD_SHA256:-b1156b5d53ddabf927a8e3f209eebc5da610d2b90ed8c14a6a945b78080bef21}"
@@ -127,7 +173,7 @@ export TF_INKLING2_ATTN_FP8="${TF_INKLING2_ATTN_FP8:-1}"
 export TF_INKLING2_PREFILL_TC="${TF_INKLING2_PREFILL_TC:-1}"
 # The kit's vLLM serves reasoning in a `reasoning` field (its inkling reasoning parser); TensorFold names it
 # reasoning_content. For Derisked both are sent (TF_REASONING_FIELD: reasoning_content, reasoning or both).
-if [[ "$RERISKED" == 1 ]]; then export TF_REASONING_FIELD="${TF_REASONING_FIELD:-both}"; fi
+if [[ "$RERISKED" == 1 || "$UNLEASHED" == 1 ]]; then export TF_REASONING_FIELD="${TF_REASONING_FIELD:-both}"; fi
 
 # One stream's cache at a CONTEXT-token window. Per token: the 8 full visits' K and V (bf16: 8 x 1024 x 2 x 2 = 32,768 bytes;
 # fp8: 8 x 2 x (1024 + 8 scales x 4) = 16,896 bytes); the 40 sliding visits keep fixed 1,536-row rings and 48 visits keep conv

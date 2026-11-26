@@ -37,6 +37,11 @@ structured output and tool calling (`libtfgrammar.so`).
   - `RERISKED=1` serves a local [`Inkling-2-Mini-Derisked`](https://huggingface.co/Blackfrost-AI/Inkling-2-Mini-Derisked) folder instead. It is
     never downloaded automatically. It is a behaviorally modified derivative with most safety refusals removed, so treat its output as
     untrusted data.
+  - `UNLEASHED=1` (or `QUANT=uncensored-nvfp4`, the same knob as the Qwen SGLang recipe) serves a local
+    [OpenUncensored/Inkling-2-Mini-Uncensored](https://huggingface.co/OpenUncensored/Inkling-2-Mini-Uncensored) folder
+    (`$HOME/models/hf/Inkling-2-Mini-Unleashed`, revision `4e5f06d7`). It is never downloaded. Put `UNLEASHED=1` in `.env` to make that
+    the default `./start.sh`. `UNABLITERATED=1` or `RERISKED=1` still selects stock or Derisked. Treat its output as untrusted data.
+    `orcarouter/Inkling-2-Mini-abliterated` is not a substitute: it is BF16 in two shards, and this engine rejects it (`ExpertFormat`).
   - Blackfrost's [deployment kit](https://huggingface.co/Blackfrost-AI/Inkling-2-Mini-Derisked/blob/main/deployment-kit/AGENT_INSTRUCTIONS.md)
     ships only for vLLM. This recipe matches it on TensorFold: vLLM's `reasoning_effort` and `reasoning` output field, the SHA-256 checks, and
     the readiness gate.
@@ -169,6 +174,7 @@ curl -s http://<spark-address>:8888/v1/chat/completions -H 'Content-Type: applic
 ```bash
 ./start.sh restart                  # restart (validates args before stopping)
 RERISKED=1 ./start.sh restart       # serve the local Inkling-2-Mini-Derisked folder
+UNLEASHED=1 ./start.sh restart      # serve the local OpenUncensored folder (Qwen QUANT=uncensored)
 PARALLEL=4 ./start.sh restart       # fewer streams, more prompt cache
 ./stop.sh                           # stop the container
 docker logs -f inkling2-mini-tf     # follow server logs
@@ -207,6 +213,7 @@ All defaults live in [`scripts/config.sh`](scripts/config.sh). Override them fro
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `RERISKED` | `0` | `0`: upstream `Inkling-2-Mini` (auto-fetched); `1`: local `Inkling-2-Mini-Derisked` |
+| `UNLEASHED` | `0` | `1`: local OpenUncensored folder. Also selected by `QUANT=uncensored-nvfp4`. Overridden by `UNABLITERATED=1` or `RERISKED=1` |
 | `MODEL_DIR` | `$HOME/models/hf/Inkling-2-Mini` | checkpoint folder, mounted read-only at `/models/ink` |
 | `PARALLEL` | `8` | concurrent request slots (each gets a full `CONTEXT` window) |
 | `CONTEXT` | `262144` | prompt + reply window a stream (up to `1048576`) |
