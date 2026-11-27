@@ -43,6 +43,11 @@ License, Version 2.0 ([`LICENSE`](LICENSE)). The image `scripts/prepare.sh` buil
 - **[libjpeg-turbo](https://libjpeg-turbo.org)** 3.1.4.1 (IJG, BSD-3-Clause and zlib licenses) and **[libwebp](https://chromium.googlesource.com/webm/libwebp)**
   1.6.0 (BSD-3-Clause) by their authors: the JPEG and WebP decoders for image inputs, built in the image (licenses under `LICENSES-codecs`).
 - **SvangenStudios**: the reply-grammar leak fix in patch `0017` (their PR #28, by way of the GLM-5.3-Flash DGX Sparks recipe's patch 0007).
+- **plotarmordev** ([plotarmordev](https://github.com/plotarmordev)): fused prompt loop `gate_prep` into `tf_ink2_loop_gate_down_rows` and direct
+  consumer-plane stores from fused prompt attention projections
+  ([PR #6](https://github.com/MiaAI-Lab/Inkling-2-Mini-DGX-Spark-TensorFold/pull/6), integrated in patch `0029` with `tf_ck8_128_row_split`),
+  and widening prompt chunks from 4,096 to 8,192 rows
+  ([PR #7](https://github.com/MiaAI-Lab/Inkling-2-Mini-DGX-Spark-TensorFold/pull/7), integrated in patch `0030`).
 - **[Basalt](https://github.com/jesdga95/basalt)** by [jesdga95](https://github.com/jesdga95): the Blackwell prefill and chunking ideas behind patches
   `0014` and `0015`.
 - **[Zig](https://ziglang.org)** by the Zig Software Foundation and contributors.
