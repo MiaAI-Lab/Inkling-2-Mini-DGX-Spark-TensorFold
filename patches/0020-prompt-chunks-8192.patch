@@ -1,0 +1,24 @@
+diff --git a/zig/src/families/inkling2/mini_model.zig b/zig/src/families/inkling2/mini_model.zig
+--- a/zig/src/families/inkling2/mini_model.zig
++++ b/zig/src/families/inkling2/mini_model.zig
+@@ -13,7 +13,7 @@
+ const DeviceBuffer = cuda.DeviceBuffer;
+ 
+ /// Prompt rows a forward takes at most: one stream's chunk.
+-pub const prompt_rows = 4096;
++pub const prompt_rows = 8192;
+ 
+ const WideGraphKey = struct {
+     rows: u16,
+diff --git a/zig/src/families/inkling2/kernels.zig b/zig/src/families/inkling2/kernels.zig
+--- a/zig/src/families/inkling2/kernels.zig
++++ b/zig/src/families/inkling2/kernels.zig
+@@ -328,7 +328,7 @@
+ const S_check = struct {
+     var on: bool = true;
+ };
+-const prompt_rows_max = 4096;
++const prompt_rows_max = 8192;
+ 
+ /// One stream's rows from which a sliding call takes tf_ink2_attn_slide (prompt passes).
+ pub const slide_rows = 64;
