@@ -14,7 +14,7 @@
 Serve **[Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)** on a single **NVIDIA DGX Spark** (GB10, `sm_121`, 128 GB
 unified memory) through an OpenAI-compatible API (plus a `/v1/messages` Messages-format endpoint). It runs [TensorFold](https://github.com/ashhart/TensorFold)'s Zig engine
 (`tensorfold-native`, Jürgen Schmied's Inkling 2 Mini CUDA engine at [PR #4441](https://github.com/ashhart/TensorFold/pull/4441), commit
-`dc2ca8a1`) plus `patches/0001`–`0028` in NVIDIA's PyTorch container. It has native CUDA vision (`inkling2_vision`: PNG, JPEG, WebP) and
+`dc2ca8a1`) plus `patches/0001`–`0030` in NVIDIA's PyTorch container. It has native CUDA vision (`inkling2_vision`: PNG, JPEG, WebP) and
 structured output and tool calling (`libtfgrammar.so`).
 
 - **Model:** a looped mixture of experts.
@@ -49,7 +49,7 @@ structured output and tool calling (`libtfgrammar.so`).
 
 ## Performance
 
-### sparkDash (DFlash2, patches `0001`–`0028`)
+### sparkDash (DFlash2, patches `0001`–`0030`)
 
 Measured with [sparkDash](https://github.com/MiaAI-Lab/sparkDash/) on one **NVIDIA DGX Spark** (GB10, `sm_121`). Settings:
 `Inkling-2-Mini-Derisked`, `CONTEXT=262144`, `PARALLEL=8`, `KV_DTYPE=fp8`, `DRAFTS=1` (`DRAFTER=dflash2`), `TF_INKLING2_ATTN_FP8=1`,
@@ -59,12 +59,12 @@ Measured with [sparkDash](https://github.com/MiaAI-Lab/sparkDash/) on one **NVID
 
 | Context | tok/s | TTFT | Prompt tokens |
 | --- | ---: | ---: | ---: |
-| 4k | **3,868.8 tok/s** | 1.23 s | 4,126 |
-| 8k | **3,734.4 tok/s** | 2.37 s | 8,226 |
-| 16k | **3,680.4 tok/s** | 4.63 s | 16,419 |
-| 32k | **3,547.9 tok/s** | 9.41 s | 32,800 |
-| 64k | **3,267.1 tok/s** | 20.23 s | 65,570 |
-| 128k | **2,827.0 tok/s** | 46.54 s | 131,103 |
+| 4k | **4,344.1 tok/s** | 1.12 s | 4,133 |
+| 8k | **4,043.1 tok/s** | 2.20 s | 8,225 |
+| 16k | **3,918.3 tok/s** | 4.36 s | 16,414 |
+| 32k | **3,772.3 tok/s** | 8.86 s | 32,800 |
+| 64k | **3,464.4 tok/s** | 19.09 s | 65,570 |
+| 128k | **2,977.7 tok/s** | 44.20 s | 131,106 |
 
 #### Decode (Prose, `temp 0.7` · thinking on · `top_k 20` · DFlash2 drafts)
 
@@ -270,7 +270,7 @@ All defaults live in [`scripts/config.sh`](scripts/config.sh). Override them fro
 - **Exact serial reference:** `"draft": false` on any request turns drafting off. Drafted replies match `"draft": false` token for token.
 - **Admission:** when all `PARALLEL` slots are full, new requests are rejected rather than queued.
 
-## Patches (`patches/0001`–`0028`)
+## Patches (`patches/0001`–`0030`)
 
 Applied in order onto TensorFold `dc2ca8a1` (PR #4441) by `scripts/prepare.sh`:
 
@@ -286,6 +286,7 @@ Applied in order onto TensorFold `dc2ca8a1` (PR #4441) by `scripts/prepare.sh`:
 | `0017` | Server fixes: the reply grammar is freed when a stream fails to start (`lane_stream.zig`); opt-in `TF_TOOL_CALL_GUARD=1` and rejected tool-envelope logs (`TF_TOOL_CALL_DEBUG=1`); `--vision-max-images` up to 100; `--dashboard-open` |
 | `0018` | DFlash2 drafter (`mini_dflash.zig`, `inkling2/dflash.cu`): `--drafter` on a DFlash2 folder loads it in place of DSpark. Committed taps go through `fc` and the hidden norm into 5 layers' 2,048-position K/V rings; one pass embeds the pending token and 7 masks and runs the two-tap dynamic convs, non-causal block attention and SwiGLU (layers as FP8 copies); an NVFP4 copy of the target head gives each row's top 16, and a GPU candidate selector walks the path (keyed draws for sampled requests). A stream alone gives the round planner each draft's chance, the selector's probability calibrated by what landed. After TensorFold's GLM-5.3-Flash CUDA DFlash2 and [tonyd2wild](https://github.com/tonyd2wild)'s [Inkling DFlash2 patch](https://github.com/tonyd2wild/Inkling-2-Mini-NVFP4-DGX-Spark) |
 | `0019`–`0028` | Decode and prefill speedups: calibrated 64-row `shared_costs` and DFlash2 `hold_costs`; skip expired DFlash2 prompt ingest and unread last-visit prompt rows; batched DFlash2 ingest, FP8 `fc`/`kv`, graphed holds, shared ring attention and two-pass radix top-16 selector; fused activation quantization in TC MoE up epilogue; opt-in FP8 tensor-core prompt attention projections (`TF_INKLING2_ATTN_FP8_TC=1`); async raw fp8 K/V prompt attention staging with native `e4m3x2` dequant and trimmed global `grid.z`; native `e2m1x2`/`e4m3x2` decode expert unpacking; 128×128 exact FP8 prompt projections; fused decode K/V 4-tap conv + prep |
+| `0029`–`0030` | Prefill fusions and wider chunks (after [plotarmordev](https://github.com/plotarmordev)'s PR #6 and PR #7): fuse prompt loop `gate_prep` into `tf_ink2_loop_gate_down_rows`, direct 4/6-plane consumer stores from `tf_ck8_128_row_split` (eliminating `m.s.fused` staging and `tf_ink2_split_cols`), and 8,192-row prompt chunks |
 
 ## Tools
 
@@ -305,7 +306,7 @@ Applied in order onto TensorFold `dc2ca8a1` (PR #4441) by `scripts/prepare.sh`:
 start.sh      set up (first run) and start the server
 stop.sh       stop it
 scripts/      config.sh, prepare.sh, fetch.sh, banner.sh
-patches/      0001–0028 applied onto TensorFold at TF_REF
+patches/      0001–0030 applied onto TensorFold at TF_REF
 tools/        verification scripts
 CREDITS.md    upstream credits
 NOTICE        third-party notices
@@ -349,6 +350,7 @@ libjpeg-turbo and libwebp, which it builds.
 - **DFlash2 drafter (`0018`):** [tonyd2wild](https://github.com/tonyd2wild)'s independent Inkling 2 Mini DFlash2 patch
   ([Inkling-2-Mini-NVFP4-DGX-Spark](https://github.com/tonyd2wild/Inkling-2-Mini-NVFP4-DGX-Spark), Apache-2.0): the NVFP4 draft-head copy and
   the lone-stream draft chances calibrated by what landed.
+- **Prefill loop gate fusion, direct plane stores & 8,192-row chunks (`0029`–`0030`):** [plotarmordev](https://github.com/plotarmordev) (PR #6 and PR #7).
 - **Model & derivative:** [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) by Thinking Machines;
   `Inkling-2-Mini-Derisked` by Blackfrost.
 - **Runtime dependencies:** [xgrammar](https://github.com/mlc-ai/xgrammar) (`libtfgrammar.so`, Apache-2.0),
