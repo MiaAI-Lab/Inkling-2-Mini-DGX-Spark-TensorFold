@@ -80,8 +80,10 @@ DRAFTS="${DRAFTS:-1}"
 # DRAFTER=dflash2 (default): incoai/Inkling-2-Mini-DFlash2 (Apache-2.0), a block-diffusion draft model at a pinned
 # revision, fetched into DRAFTER_DIR by scripts/fetch.sh and SHA-256 checked, mounted read-only at /models/draft.
 # DRAFTER=dspark: the checkpoint's own DSpark head (mtp.safetensors), as before.
+# DRAFTER=hybrid (patch 0040): DFlash2 for prompts shorter than TF_INKLING2_DFLASH2_MAX_PROMPT (default 2,048) tokens and
+# the DSpark head from there; DSpark's global layer sees the whole context, so it drafts long grounded prompts better.
 DRAFTER="${DRAFTER:-dflash2}"
-[[ "$DRAFTER" =~ ^(dflash2|dspark)$ ]] || { echo "DRAFTER is dflash2 or dspark, not $DRAFTER" >&2; exit 1; }
+[[ "$DRAFTER" =~ ^(dflash2|dspark|hybrid)$ ]] || { echo "DRAFTER is dflash2, dspark or hybrid, not $DRAFTER" >&2; exit 1; }
 DRAFTER_DIR="${DRAFTER_DIR:-$HOME/models/hf/Inkling-2-Mini-DFlash2}"
 DRAFTER_REPO="${DRAFTER_REPO:-incoai/Inkling-2-Mini-DFlash2}"
 DRAFTER_REV="${DRAFTER_REV:-4f9088ea66c21f2b99ed657d1941c306b03e84d2}"
@@ -89,13 +91,23 @@ DRAFTER_NAME="model.safetensors"
 DRAFTER_SHA256="${DRAFTER_SHA256:-217980ab00d116693fa5946df7bbfd967caf5fac1f529afd541fbd470ddb54ee}"
 DRAFTER_MOUNT=/models/draft
 DRAFTER_FETCH="${DRAFTER_FETCH:-1}"   # scripts/prepare.sh runs scripts/fetch.sh drafter when the folder is incomplete
-DFLASH2=0; [[ "$DRAFTS" == 1 && "$DRAFTER" == dflash2 ]] && DFLASH2=1
+DFLASH2=0; [[ "$DRAFTS" == 1 && ( "$DRAFTER" == dflash2 || "$DRAFTER" == hybrid ) ]] && DFLASH2=1
+DSPARK=0; [[ "$DRAFTS" == 1 && ( "$DRAFTER" == dspark || "$DRAFTER" == hybrid ) ]] && DSPARK=1
+# hybrid: the checkpoint folder is the DSpark head's (mini_hybrid.zig reads TF_INKLING2_DSPARK_DIR)
+if [[ "$DRAFTS" == 1 && "$DRAFTER" == hybrid ]]; then export TF_INKLING2_DSPARK_DIR="${TF_INKLING2_DSPARK_DIR:-$MODEL_MOUNT}"; fi
+# DSpark's measured depth policy (perf.py on this recipe's base with DSpark): lone streams priced by
+# their measured costs (c1 +17.9%) and shared rounds drafting full blocks (c8 +8.0%). DFlash2 alone keeps 0018's policy.
+if [[ "$DSPARK" == 1 ]]; then
+  export TF_INKLING2_LONE_COSTS="${TF_INKLING2_LONE_COSTS:-1}"
+  export TF_INKLING2_SHARED_COSTS="${TF_INKLING2_SHARED_COSTS:-0}"
+fi
 # What loading takes of MemAvailable: the engine reported "model 22.82 GiB" with no drafter (2026-11-22). The DSpark
 # drafter adds its 0.6 GiB of weights, a 0.1 GiB folded head and its scratch; DFlash2 1.67 GiB (FP8 layers, an NVFP4 target
 # head copy, the selector's codebooks and scratch; "model 26.18 GiB" with 4 streams of 32k and an FP8 head, 2026-11-24); the
 # vision tower (VISION=1) 0.6 GiB. PROVISIONAL.
-if [[ "$DFLASH2" == 1 ]]; then WEIGHTS_GIB="${WEIGHTS_GIB:-27}"; else WEIGHTS_GIB="${WEIGHTS_GIB:-25}"; fi
-drafts_label() { if [[ "$DRAFTS" != 1 ]]; then echo off; elif [[ "$DRAFTER" == dflash2 ]]; then echo DFlash2; else echo DSpark; fi; }
+if [[ "$DFLASH2" == 1 && "$DSPARK" == 1 ]]; then WEIGHTS_GIB="${WEIGHTS_GIB:-29}"
+elif [[ "$DFLASH2" == 1 ]]; then WEIGHTS_GIB="${WEIGHTS_GIB:-27}"; else WEIGHTS_GIB="${WEIGHTS_GIB:-25}"; fi
+drafts_label() { if [[ "$DRAFTS" != 1 ]]; then echo off; elif [[ "$DRAFTER" == hybrid ]]; then echo DFlash2+DSpark; elif [[ "$DRAFTER" == dflash2 ]]; then echo DFlash2; else echo DSpark; fi; }
 # VISION=1 loads the checkpoint's inkling2_vision tower (--vision, ~0.6 GiB of bf16 weights) for image inputs (PNG,
 # JPEG, WebP). VISION_URLS=1 also lets image_url fetch http(s) URLs (data: URLs always work). VISION_MAX_IMAGES and
 # VISION_IMAGE_TOKENS (an image's token budget, engine default 4096) are passed when set.
@@ -116,6 +128,17 @@ export TENSORFOLD_MEMORY_RESERVE_GIB="${TENSORFOLD_MEMORY_RESERVE_GIB:-9}"
 # The target's attention caches: bf16 (exact, the default) or fp8 (`--kv-cache fp8`: e4m3 codes with a scale a position and
 # key head, about half the bytes; lossy, so a reply can differ from the bf16 one). The drafter's own caches stay bf16.
 KV_DTYPE="${KV_DTYPE:-fp8}"
+# SHARED_KV=1 (patch 0037, bf16 KV only): the 8 whole-cache visits live on 2 MiB pages leased per request from one pool
+# instead of a full CONTEXT window reserved per stream at startup, so PARALLEL x CONTEXT may exceed the memory (8 x 262,144
+# bf16 with a 20 GiB prompt cache); a request waits when the pool cannot hold its window. With a DSpark head loaded its
+# global ring is leased the same way (TF_INKLING2_DRAFT_PAGES=1, patch 0038). Prompt-cache snapshots share whole pages.
+SHARED_KV="${SHARED_KV:-0}"
+[[ "$SHARED_KV" =~ ^[01]$ ]] || { echo "SHARED_KV is 0 or 1, not $SHARED_KV" >&2; exit 1; }
+if [[ "$SHARED_KV" == 1 ]]; then
+  [[ "$KV_DTYPE" == bf16 ]] || { echo "SHARED_KV=1 needs KV_DTYPE=bf16" >&2; exit 1; }
+  export TF_INKLING2_SHARED_KV=1
+  [[ "$DSPARK" == 1 ]] && export TF_INKLING2_DRAFT_PAGES="${TF_INKLING2_DRAFT_PAGES:-1}"
+fi
 # FP8 attention projections (patch 0012; lossy, the engine's default is off): half the attention weight bytes, decode
 # about +22% at one stream. Teacher-forced top-1 agreement with bf16 98.26% (fp8 KV alone 98.52%).
 # TF_INKLING2_ATTN_FP8=0 serves the exact bf16 projections.
@@ -143,13 +166,14 @@ kv_gib() {
   local ctx=${1:-$CONTEXT} per=32768
   [[ "$KV_DTYPE" == fp8 ]] && per=16896
   [[ "$ctx" =~ ^[0-9]+$ ]] || ctx=$CONTEXT
-  [[ "$DRAFTS" == 1 && "$DRAFTER" == dspark ]] && per=$((per + 4096))
+  [[ "$DSPARK" == 1 ]] && per=$((per + 4096))
   echo $(( (per * ctx + 268435456 + 1073741823) / 1073741824 ))
 }
 # MemAvailable a start needs: weights, every stream's window, scratch slack and the floor. PROVISIONAL.
 mem_need_gib() {
-  local ctx=${1:-$CONTEXT}
-  echo $(( WEIGHTS_GIB + PARALLEL * $(kv_gib "$ctx") + 4 + MEM_FLOOR_GIB ))
+  local ctx=${1:-$CONTEXT} streams=$PARALLEL
+  [[ "$SHARED_KV" == 1 ]] && streams=1   # leased per request: one full window must fit, the rest waits for pages
+  echo $(( WEIGHTS_GIB + streams * $(kv_gib "$ctx") + 4 + MEM_FLOOR_GIB ))
 }
 MEM_NEED_GIB="${MEM_NEED_GIB:-}"
 MEM_FLOOR_GIB="${MEM_FLOOR_GIB:-$TENSORFOLD_MEMORY_RESERVE_GIB}"

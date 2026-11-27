@@ -12,11 +12,13 @@
 #   CONTEXT=131072 ./start.sh restart  # a shorter window leaves memory for more streams or the prompt cache
 #   DRAFTS=0 ./start.sh restart        # no drafter (--no-drafts)
 #   DRAFTER=dspark ./start.sh restart  # the checkpoint's own DSpark head instead of DFlash2
+#   DRAFTER=hybrid ./start.sh restart  # DFlash2 below 2,048 prompt tokens, DSpark from there
+#   KV_DTYPE=bf16 SHARED_KV=1 ./start.sh restart --prompt-cache-gib 20  # 8 bf16 windows leased from one page pool
 #   VISION=0 ./start.sh restart        # text only: no vision tower (saves ~0.6 GiB)
 #   DRY_RUN=1 ./start.sh               # print the docker command and exit
 # Extra arguments go to tensorfold-native serve after the defaults, so they win.
 # Settings, from the environment or ./.env (scripts/config.sh):
-#   serving  CONTEXT, PARALLEL, MAX_TOKENS, THINKING, REASONING_EFFORT, DRAFTS, DRAFTER, VISION, VISION_URLS,
+#   serving  CONTEXT, PARALLEL, MAX_TOKENS, THINKING, REASONING_EFFORT, DRAFTS, DRAFTER, KV_DTYPE, SHARED_KV, VISION, VISION_URLS,
 #            VISION_MAX_IMAGES, VISION_IMAGE_TOKENS, TEMPERATURE, TOP_P, TOP_K, SERVED_NAME, HOST, PORT
 #   files    MODEL_DIR, DRAFTER_DIR, KERNEL_CACHE, STATE_DIR
 #   image    IMAGE, TF_REPO, TF_REF, ZIG_VERSION, BASE_IMAGE, NATIVE_FP_DECODE, CONTAINER_NAME
@@ -49,7 +51,7 @@ SERVE_ARGS=(--context "$CONTEXT" --parallel "$PARALLEL" --max-tokens "$MAX_TOKEN
 if [[ "$THINKING" == 1 ]]; then SERVE_ARGS+=(--thinking); else SERVE_ARGS+=(--no-thinking); fi
 [[ -z "$REASONING_EFFORT" ]] || SERVE_ARGS+=(--reasoning-effort "$REASONING_EFFORT")
 if [[ "$DRAFTS" != 1 ]]; then SERVE_ARGS+=(--no-drafts)
-elif [[ "$DRAFTER" == dflash2 ]]; then SERVE_ARGS+=(--drafter "$DRAFTER_MOUNT")
+elif [[ "$DRAFTER" == dflash2 || "$DRAFTER" == hybrid ]]; then SERVE_ARGS+=(--drafter "$DRAFTER_MOUNT")
 else SERVE_ARGS+=(--drafter "$MODEL_MOUNT"); fi
 if [[ "$VISION" == 1 ]]; then
   SERVE_ARGS+=(--vision)
@@ -87,8 +89,8 @@ source ./scripts/banner.sh
 echo
 banner
 printf '\n%s  Mia'"'"'s TensorFold Start Script%s\n' "$M" "$R"
-printf '%s  %s · %s at once · %s-token window · %s KV · drafts %s · port %s%s\n\n' "$D" "$MODEL_LABEL" \
-  "$(arg_value --parallel)" "$(arg_value --context)" "$KV_DTYPE" "$(drafts_label)" "$PORT" "$R"
+printf '%s  %s · %s at once · %s-token window · %s KV%s · drafts %s · port %s%s\n\n' "$D" "$MODEL_LABEL" \
+  "$(arg_value --parallel)" "$(arg_value --context)" "$KV_DTYPE" "$([[ "$SHARED_KV" == 1 ]] && echo ' (shared pages)')" "$(drafts_label)" "$PORT" "$R"
 STEPS=5
 step() { printf '%s[%s/%s]%s %s%s%s\n' "$M" "$1" "$STEPS" "$R" "$B" "$2" "$R"; }
 
