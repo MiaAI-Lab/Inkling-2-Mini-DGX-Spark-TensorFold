@@ -125,6 +125,11 @@ export TF_INKLING2_ATTN_FP8="${TF_INKLING2_ATTN_FP8:-1}"
 # accuracy set scored 732 either way, teacher-forced top-1 agreement with the exact path 96.3%.
 # TF_INKLING2_PREFILL_TC=0 serves the exact bf16 prefill.
 export TF_INKLING2_PREFILL_TC="${TF_INKLING2_PREFILL_TC:-1}"
+# FP8 tensor-core prompt attention projections (patch 0023; lossy, the engine's default is off): prompt activations
+# are quantized per-row to e4m3 for native FP8 MMA (decode stays BF16). Adds +5-8% prefill; teacher-forced top-1
+# agreement with exact bf16 96.18%, qeval easy 240/240 & hard 239/240 parity, 200k needle 3/3 pass.
+# TF_INKLING2_ATTN_FP8_TC=0 serves exact BF16-activation prompt attention projections.
+export TF_INKLING2_ATTN_FP8_TC="${TF_INKLING2_ATTN_FP8_TC:-1}"
 # The kit's vLLM serves reasoning in a `reasoning` field (its inkling reasoning parser); TensorFold names it
 # reasoning_content. For Derisked both are sent (TF_REASONING_FIELD: reasoning_content, reasoning or both).
 if [[ "$RERISKED" == 1 ]]; then export TF_REASONING_FIELD="${TF_REASONING_FIELD:-both}"; fi

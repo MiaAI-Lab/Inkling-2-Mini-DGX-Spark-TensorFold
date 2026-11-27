@@ -1,0 +1,100 @@
+From d7315a7d7e0b91cb38994eebb7b0cf6c9cb97e0f Mon Sep 17 00:00:00 2001
+From: MiaAI Lab <83042094+MiaAI-Lab@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 00:17:05 +0200
+Subject: [PATCH] inkling2: extend shared_costs through 64 rows and update
+ DFlash2 hold_costs (TF_INKLING2_REPRICE)
+
+---
+ zig/src/families/inkling2/mini_backend.zig | 29 ++++++++++++++++++----
+ zig/src/families/inkling2/mini_dflash.zig  | 13 ++++++++--
+ 2 files changed, 35 insertions(+), 7 deletions(-)
+
+diff --git a/zig/src/families/inkling2/mini_backend.zig b/zig/src/families/inkling2/mini_backend.zig
+index 94cbc10c2..96b91e577 100644
+--- a/zig/src/families/inkling2/mini_backend.zig
++++ b/zig/src/families/inkling2/mini_backend.zig
+@@ -200,20 +200,39 @@ pub const Mini = struct {
+     /// with TF_INKLING2_COPY_DRAFTS=1), streams sharing a forward.
+     pub fn facts(x: *const Mini) lanes.Model {
+         const copies = copyDrafts();
+-        return .{ .copy_drafts = copies, .exact_width = verify_rows, .gpu_tokens = false, .mtp = false, .speculate = false, .hidden_rows = true, .plain_share = true, .batch_rows = round_rows, .max_streams = @intCast(@min(x.m.slots, round_rows)), .shared_costs = if (sharedCostsOn()) &shared_costs else &.{}, .window_costs = if (loneCostsOn()) &lone_costs else &.{}, .window_costs_lone = true };
++        const sc: []const lanes.config.Cost = if (!sharedCostsOn()) &.{} else if (repriceOn()) &shared_costs else &shared_costs_old;
++        const wc: []const lanes.config.Cost = if (loneCostsOn()) &lone_costs else &.{};
++        return .{ .copy_drafts = copies, .exact_width = verify_rows, .gpu_tokens = false, .mtp = false, .speculate = false, .hidden_rows = true, .plain_share = true, .batch_rows = round_rows, .max_streams = @intCast(@min(x.m.slots, round_rows)), .shared_costs = sc, .window_costs = wc, .window_costs_lone = true };
+     }
+ 
+-    /// A shared verify round's ms by total rows on one GB10 (TF_INKLING2_VERIFY_TRACE=1, 2026-11-23, greedy, short
+-    /// contexts, 2 to 4 streams). Each MoE row routes to its own experts, so a wide round costs far more than a plain
+-    /// one; without these the depth rule drafts every shared stream a full block. Lone streams keep their own rule.
++    /// A shared verify round's ms by total rows on one GB10 (TF_INKLING2_VERIFY_TRACE=1, 2026-11-26, FP8 attention,
++    /// wide graphs, DFlash2, extended through 64 rows). TF_INKLING2_REPRICE=0 restores the 2026-11-23 table.
+     const shared_costs = [_]lanes.config.Cost{
++        .{ .width = 1, .ms = 30.1 },  .{ .width = 2, .ms = 38.3 },  .{ .width = 3, .ms = 45.8 },  .{ .width = 4, .ms = 50.6 },
++        .{ .width = 8, .ms = 60.5 },  .{ .width = 12, .ms = 72.0 }, .{ .width = 16, .ms = 76.0 }, .{ .width = 20, .ms = 81.0 },
++        .{ .width = 24, .ms = 88.7 }, .{ .width = 32, .ms = 95.0 }, .{ .width = 40, .ms = 99.0 }, .{ .width = 48, .ms = 103.4 },
++        .{ .width = 56, .ms = 108.8 }, .{ .width = 64, .ms = 112.0 },
++    };
++
++    const shared_costs_old = [_]lanes.config.Cost{
+         .{ .width = 1, .ms = 30.1 },  .{ .width = 2, .ms = 38.3 },  .{ .width = 3, .ms = 45.8 },  .{ .width = 4, .ms = 50.6 },
+         .{ .width = 8, .ms = 60.5 },  .{ .width = 12, .ms = 72.0 }, .{ .width = 16, .ms = 76.0 }, .{ .width = 20, .ms = 81.0 },
+         .{ .width = 24, .ms = 88.7 }, .{ .width = 32, .ms = 102.8 },
+     };
+ 
+-    /// A lone stream's verify round ms by rows on the same GB10 (one stream: its conv backup, no graph past one row).
++    /// TF_INKLING2_REPRICE=0: restore the 2026-11-23 shared_costs and hold_costs tables.
++    fn repriceOn() bool {
++        const v = std.c.getenv("TF_INKLING2_REPRICE") orelse return true;
++        return v[0] != '0';
++    }
++
++    /// A lone stream's verify round ms by rows on one GB10 (2026-11-26, wide graphs, FP8 attention).
+     const lone_costs = [_]lanes.config.Cost{
++        .{ .width = 1, .ms = 23.3 }, .{ .width = 2, .ms = 29.9 }, .{ .width = 3, .ms = 35.6 }, .{ .width = 4, .ms = 38.4 },
++        .{ .width = 5, .ms = 42.6 }, .{ .width = 6, .ms = 46.1 }, .{ .width = 7, .ms = 48.5 }, .{ .width = 8, .ms = 51.2 },
++    };
++
++    const lone_costs_old = [_]lanes.config.Cost{
+         .{ .width = 1, .ms = 30.1 }, .{ .width = 2, .ms = 36.1 }, .{ .width = 3, .ms = 39.9 }, .{ .width = 4, .ms = 44.9 },
+         .{ .width = 5, .ms = 47.8 }, .{ .width = 6, .ms = 50.6 }, .{ .width = 8, .ms = 58.7 }, .{ .width = 9, .ms = 61.0 },
+     };
+diff --git a/zig/src/families/inkling2/mini_dflash.zig b/zig/src/families/inkling2/mini_dflash.zig
+index f1dcf2481..f16be42a0 100644
+--- a/zig/src/families/inkling2/mini_dflash.zig
++++ b/zig/src/families/inkling2/mini_dflash.zig
+@@ -88,13 +88,22 @@ fn layers8On() bool {
+ 
+ const HoldCost = lanes.hold_price.HoldCost;
+ /// A hold pass's ms on one GB10 (TF_INKLING2_DRAFT_TRACE=1): by streams held together; one block a stream at any depth.
+-/// (2026-11-24, FP8 layers and head, 262,144-token streams.)
++/// (2026-11-26, FP8 layers and NVFP4 head.) TF_INKLING2_REPRICE=0 restores the 2026-11-24 table.
+ const hold_costs = [_]HoldCost{
++    .{ .streams = 1, .depth = 1, .ms = 3.7 }, .{ .streams = 1, .depth = 7, .ms = 3.7 },
++    .{ .streams = 2, .depth = 1, .ms = 4.0 }, .{ .streams = 2, .depth = 7, .ms = 4.0 },
++    .{ .streams = 4, .depth = 1, .ms = 4.8 }, .{ .streams = 4, .depth = 7, .ms = 4.8 },
++    .{ .streams = 8, .depth = 1, .ms = 6.1 }, .{ .streams = 8, .depth = 7, .ms = 6.1 },
++};
++const hold_costs_old = [_]HoldCost{
+     .{ .streams = 1, .depth = 1, .ms = 4.3 }, .{ .streams = 1, .depth = 7, .ms = 4.3 },
+     .{ .streams = 2, .depth = 1, .ms = 4.6 }, .{ .streams = 2, .depth = 7, .ms = 4.6 },
+     .{ .streams = 4, .depth = 1, .ms = 5.2 }, .{ .streams = 4, .depth = 7, .ms = 5.2 },
+     .{ .streams = 8, .depth = 1, .ms = 6.4 }, .{ .streams = 8, .depth = 7, .ms = 6.4 },
+ };
++fn repriceOn() bool {
++    return envOn("TF_INKLING2_REPRICE");
++}
+ /// TF_INKLING2_DFLASH2_CHANCES=0: the depth rule's per-depth rates price the drafts. On (the default): a stream alone
+ /// gives each draft's chance of landing, the selector's own probability calibrated by what landed (lanes' Landing
+ /// table, greedy and sampled apart), so a round verifies only the rows worth their cost. The raw probabilities alone
+@@ -597,7 +606,7 @@ pub const Drafter = struct {
+ 
+     fn factsFn(ptr: *anyopaque) dr.Facts {
+         const x = self(ptr);
+-        const costs: []const HoldCost = if (costsOn()) &hold_costs else &.{};
++        const costs: []const HoldCost = if (!costsOn()) &.{} else if (repriceOn()) &hold_costs else &hold_costs_old;
+         return .{ .depth = depth, .step_ms = 0, .fixed_block = true, .plain_guard = true, .batched = true, .stream_bytes = laneBytes(), .hold_costs = costs, .chances = x.chances, .slack = if (x.chances) depth else 0, .confidence_floor = confidence() };
+     }
+ 
+-- 
+2.43.0
+
