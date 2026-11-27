@@ -1,0 +1,197 @@
+diff --git a/zig/src/core/engine_stats.zig b/zig/src/core/engine_stats.zig
+index 5bc253e..5ce869e 100644
+--- a/zig/src/core/engine_stats.zig
++++ b/zig/src/core/engine_stats.zig
+@@ -1,10 +1,14 @@
+ //! Counters reported by an engine when one reply ends.
+ 
+ pub const Stats = struct {
++    pub const depth_slots = @import("lanes").Stream.depth_slots;
+     rounds: u64 = 0,
+     grammar: ?@import("lanes").grammar_time.Sum = null,
+     drafted: u64 = 0,
+     accepted: u64 = 0,
++    /// Draft rows verified and kept by depth (slot d: depth d + 1), where the lane rounds count them.
++    depth_offered: [depth_slots]u32 = @splat(0),
++    depth_accepted: [depth_slots]u32 = @splat(0),
+     /// The narrowest verify window of the reply's rounds (drafted replies: 2 or more).
+     min_rows: u32 = 0,
+     prefill_widths: []const u32 = &.{},
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index 1811a85..a55ebfe 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -320,7 +320,7 @@ pub const LaneHost = struct {
+         h.gpa.free(job.marks);
+         h.gpa.free(job.key);
+         const s = &job.stream;
+-        const stats: Stats = if (job.started) .{ .rounds = s.rounds, .grammar = if (s.grammar_time.windows > 0) s.grammar_time else null, .drafted = s.drafted, .accepted = s.accepted, .min_rows = s.min_rows, .prefill_widths = s.prefill_widths.items, .loop_period = s.loop_period, .gpu_seconds = s.gpu_seconds, .prefill_seconds = if (job.prefilled) |done| @as(f64, @floatFromInt(@as(i64, @intCast(@max(0, done - job.began))))) / 1e9 else null } else .{};
++        const stats: Stats = if (job.started) .{ .rounds = s.rounds, .grammar = if (s.grammar_time.windows > 0) s.grammar_time else null, .drafted = s.drafted, .accepted = s.accepted, .depth_offered = s.depth_offered, .depth_accepted = s.depth_accepted, .min_rows = s.min_rows, .prefill_widths = s.prefill_widths.items, .loop_period = s.loop_period, .gpu_seconds = s.gpu_seconds, .prefill_seconds = if (job.prefilled) |done| @as(f64, @floatFromInt(@as(i64, @intCast(@max(0, done - job.began))))) / 1e9 else null } else .{};
+         var told = if (job.started) recalls.finished(h, job, reason, stats) else stats;
+         told.queued_seconds = if (job.admitted_ns) |at| @as(f64, @floatFromInt(@max(0, at - job.submitted))) / 1e9 else 0;
+         emit(job, .{ .finished = .{ .reason = reason, .stats = told, .message = message } });
+diff --git a/zig/src/core/lanes/engine.zig b/zig/src/core/lanes/engine.zig
+index 285fd9c..987adae 100644
+--- a/zig/src/core/lanes/engine.zig
++++ b/zig/src/core/lanes/engine.zig
+@@ -289,6 +289,7 @@ pub const Engine = struct {
+                 e.accepted += kept;
+                 s.drafted += rows - 1;
+                 s.accepted += kept;
++                countDepths(s, parents, rows, kept);
+                 // the proposal's own rows: the grammar's drafts after them are neither the proposer's nor the head's
+                 const own_end = if (p.grammar_from > 0) p.grammar_from else rows;
+                 var own_kept: usize = 0;
+@@ -542,3 +543,31 @@ pub const Engine = struct {
+         e.backend.release(s);
+     }
+ };
++
++/// A window's draft rows by depth into the stream's counters: each row offered at its depth (a chain's row r at r, a
++/// tree's by its parents), and the kept path's rows at depths 1 to `kept`.
++pub fn countDepths(s: *Stream, parents: []const i32, rows: usize, kept: usize) void {
++    const last = Stream.depth_slots - 1;
++    for (1..rows) |r| s.depth_offered[@min(rowDepth(parents, r), Stream.depth_slots) - 1] += 1;
++    for (1..kept + 1) |d| s.depth_accepted[@min(d - 1, last)] += 1;
++}
++
++fn rowDepth(parents: []const i32, r: usize) usize {
++    if (parents.len <= r) return r; // a chain
++    var d: usize = 0;
++    var at: i32 = @intCast(r);
++    while (at > 0 and d < parents.len) : (d += 1) at = parents[@intCast(at)];
++    return @max(d, 1);
++}
++
++test "per-depth draft counters: a chain's rows by position, a tree's by its parents, sums match drafted and kept" {
++    var s = try Stream.init(std.testing.allocator, .{ .id = "depths", .prompt = &.{ 1, 2 }, .max_new = 8 });
++    defer s.deinit(std.testing.allocator);
++    countDepths(&s, &.{}, 5, 2); // a chain of 4 drafts, 2 kept
++    countDepths(&s, &.{ -1, 0, 1, 1 }, 4, 1); // a tree: rows 2 and 3 both at depth 2
++    try std.testing.expectEqualSlices(u32, &.{ 2, 3, 1, 1 }, s.depth_offered[0..4]);
++    try std.testing.expectEqualSlices(u32, &.{ 2, 1, 0, 0 }, s.depth_accepted[0..4]);
++    var off: u32 = 0;
++    for (s.depth_offered) |v| off += v;
++    try std.testing.expectEqual(@as(u32, 7), off);
++}
+diff --git a/zig/src/core/lanes/stream.zig b/zig/src/core/lanes/stream.zig
+index 00faf77..25efc14 100644
+--- a/zig/src/core/lanes/stream.zig
++++ b/zig/src/core/lanes/stream.zig
+@@ -151,6 +151,8 @@ pub const Spec = struct {
+ };
+ 
+ pub const Stream = struct {
++    /// Depths the per-depth draft counters keep apart (DSpark's block is 7 drafts deep).
++    pub const depth_slots = 16;
+     embedding: ?@import("embedding.zig").Batch = null,
+     readout: ?*const @import("readout.zig").Spec = null, // the request's; the backend writes its logits
+     id: []const u8,
+@@ -219,6 +221,10 @@ pub const Stream = struct {
+     copied_broke: [2]f64 = .{ 0, 0 }, // and its copies that broke before their end
+     drafted: u64 = 0,
+     accepted: u64 = 0,
++    /// Draft rows verified and kept by depth (slot d: depth d + 1; deeper rows count in the last slot): their sums
++    /// are `drafted` and `accepted`.
++    depth_offered: [depth_slots]u32 = @splat(0),
++    depth_accepted: [depth_slots]u32 = @splat(0),
+     branch_rows: u64 = 0, // suffix-match branch rows verified (lanes/fill.zig)
+     branch_accepted: u64 = 0, // of those, rows on the accepted path
+     graft_hit: f64 = 1, // recent share of grafted rows kept; a read of the chain that grafted none counts as a miss
+diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
+index 23810f0..4eca8d1 100644
+--- a/zig/src/server/chat.zig
++++ b/zig/src/server/chat.zig
+@@ -290,6 +290,7 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
+     preparing = false;
+     var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .asked = input.cancel, .reply_id = input.id, .seed = if (request.sampling) |v| v.seed else null, .sink = sink, .thinking = prepared.reasoning or (srv.text.vtable.format != .kimi and srv.info.capability(.reasoning) and reply_text.isChannel(srv.markers)), .chat = input.prompt == null, .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .token_ids = prepared.token_ids, .lp = if (request.logprobs != null) .{ .positions = if (sink) |s| s.tokens != null else false } else null, .loop_stop = request.loop_stop, .single = fields_mod.flag(input.fields, "tool_call_single") orelse false, .required = fields_mod.flag(input.fields, "tool_call_required") orelse false, .recover = input.prompt == null and request.structure == null, .deadline_ns = prepared.deadline_ns };
+     defer srv.noteRequest(prepared.prompt_len, cached_tokens.within(box.cached, prepared.prompt_len), gen.collected.items.len, box.stats.drafted, box.stats.accepted, box.stats.rounds, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds, if (box.stats.prefill_seconds != null) box.stats.queued_seconds else null);
++    defer srv.metrics.noteDepths(srv.io, box.stats.depth_offered, box.stats.depth_accepted);
+     errdefer if (!gen.engine_done) gen.cancel(); // the engine writes to the mailbox until it says finished
+     if (srv.recipients and input.prompt == null) gen.recipient = try recipient_reply.Reading.of(a, srv.text, request.prompt, input.tools, prepared.reasoning);
+     const result: Failure!Reply = blk: {
+diff --git a/zig/src/server/chat_generation.zig b/zig/src/server/chat_generation.zig
+index 1ce4683..d08533f 100644
+--- a/zig/src/server/chat_generation.zig
++++ b/zig/src/server/chat_generation.zig
+@@ -419,6 +419,21 @@ pub const Generation = struct {
+         try spec.put(a, "accepted", try json.intValue(a, s.accepted));
+         try spec.put(a, "acceptance_rate", .{ .float = if (s.drafted > 0) @as(f64, @floatFromInt(s.accepted)) / @as(f64, @floatFromInt(s.drafted)) else 0 });
+         try spec.put(a, "tokens_per_round", .{ .float = if (s.rounds > 0) @as(f64, @floatFromInt(g.collected.items.len)) / @as(f64, @floatFromInt(s.rounds)) else 0 });
++        // draft rows by depth (index d: depth d + 1), through the deepest depth offered
++        var deepest: usize = 0;
++        for (s.depth_offered, 0..) |v, i| if (v > 0) {
++            deepest = i + 1;
++        };
++        if (deepest > 0) {
++            const offered = try a.alloc(Value, deepest);
++            const kept = try a.alloc(Value, deepest);
++            for (offered, kept, s.depth_offered[0..deepest], s.depth_accepted[0..deepest]) |*o, *k, ov, kv| {
++                o.* = try json.intValue(a, ov);
++                k.* = try json.intValue(a, kv);
++            }
++            try spec.put(a, "offered_by_depth", .{ .array = offered });
++            try spec.put(a, "accepted_by_depth", .{ .array = kept });
++        }
+         const counters = try a.dupe(u8, m.telemetry); // parsed strings point into it: it outlives the box
+         if (counters.len > 0) switch (try json.parse(a, counters)) {
+             .ok => |v| try spec.put(a, "proposer", v),
+diff --git a/zig/src/server/metrics.zig b/zig/src/server/metrics.zig
+index 9955502..c0a0f0c 100644
+--- a/zig/src/server/metrics.zig
++++ b/zig/src/server/metrics.zig
+@@ -41,6 +41,8 @@ pub const Metrics = struct {
+     generation: u64 = 0,
+     drafted: u64 = 0,
+     accepted: u64 = 0,
++    depth_offered: [depth_slots]u64 = @splat(0), // draft rows verified by depth (slot d: depth d + 1)
++    depth_accepted: [depth_slots]u64 = @splat(0), // and kept
+     rounds: u64 = 0,
+     kept_unoffered: u64 = 0,
+     kept_malformed: u64 = 0,
+@@ -75,6 +77,16 @@ pub const Metrics = struct {
+         if (tpot) |t| m.tpot.observe(t);
+     }
+ 
++    /// One finished request's draft rows by depth, verified and kept.
++    pub fn noteDepths(m: *Metrics, io: std.Io, offered: [depth_slots]u32, accepted: [depth_slots]u32) void {
++        m.mutex.lockUncancelable(io);
++        defer m.mutex.unlock(io);
++        for (&m.depth_offered, &m.depth_accepted, offered, accepted) |*o, *k, ov, kv| {
++            o.* += ov;
++            k.* += kv;
++        }
++    }
++
+     /// One finished request's wait for admission; nothing is kept unless the phase families are on.
+     pub fn noteQueue(m: *Metrics, io: std.Io, queued: f64) void {
+         if (!m.phases) return;
+@@ -227,6 +239,8 @@ pub const Metrics = struct {
+         try pools(w, "kv_cache_usage_perc", "stream", live, window);
+         try gauge(w, "spec_decode_num_draft_tokens_total", "counter", "Draft tokens verified on finished requests, this server's single draft counter.", snap.drafted);
+         try gauge(w, "spec_decode_num_accepted_tokens_total", "counter", "Draft tokens kept on finished requests.", snap.accepted);
++        try depthFamily(w, "spec_decode_num_offered_tokens_per_pos_total", "Draft tokens verified on finished requests by draft position (0: the first draft), vLLM's position label.", &snap.depth_offered, &snap.depth_offered);
++        try depthFamily(w, "spec_decode_num_accepted_tokens_per_pos_total", "Draft tokens kept on finished requests by draft position (0: the first draft), under vLLM's name.", &snap.depth_accepted, &snap.depth_offered);
+         if (keeps) {
+             try gauge(w, "prefix_cache_queries_total", "counter", "Prompt tokens of finished requests, looked up in the kept prompt states, under vLLM's name.", snap.prompt);
+             try gauge(w, "prefix_cache_hits_total", "counter", "Prompt tokens of finished requests restored from kept prompt states, under vLLM's name.", snap.cached);
+@@ -244,6 +258,19 @@ fn family(w: *std.Io.Writer, name: []const u8, kind: []const u8, help: []const u
+     try w.print("# HELP {s}{s} {s}\n# TYPE {s}{s} {s}\n", .{ prefix, name, help, prefix, name, kind });
+ }
+ 
++/// Depths the per-depth draft counters keep apart (the engine's).
++const depth_slots = @import("engine_api").Stats.depth_slots;
++
++/// A counter by draft position, positions 0 through the deepest offered (at least 0 to 6, DSpark's block).
++fn depthFamily(w: *std.Io.Writer, name: []const u8, help: []const u8, values: *const [depth_slots]u64, offered: *const [depth_slots]u64) !void {
++    try family(w, name, "counter", help);
++    var deepest: usize = 7;
++    for (offered, 0..) |v, i| if (v > 0) {
++        deepest = @max(deepest, i + 1);
++    };
++    for (values[0..deepest], 0..) |v, i| try w.print("{s}{s}{{position=\"{d}\"}} {d}\n", .{ prefix, name, i, v });
++}
++
+ fn gauge(w: *std.Io.Writer, name: []const u8, kind: []const u8, help: []const u8, value: u64) !void {
+     try family(w, name, kind, help);
+     try w.print("{s}{s} {d}\n", .{ prefix, name, value });

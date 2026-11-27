@@ -1,0 +1,1375 @@
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index 99e6e3c..00b0043 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -334,6 +334,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
+     @import("drama3_host.zig").metal(b, mods.core, native_modules.api);
+     const safety = b.step("test-kv-safety-host", "Actual native KV startup budget and paged constructors under allocation/completion faults");
+     for ([_]*std.Build.Module{ native, mods.nemotron }) |m| safety.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m, .filters = &.{"kv safety:"} })).step);
++    b.step("test-kv-ledger-host", "The CUDA host's KV ledger, shared-KV costs and stream count without a GPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = native, .filters = &.{ "kv ledger", "shared KV" } })).step);
+     b.step("test-cache-capacity-host", "Startup cache capacity facts and warnings without a GPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = native, .filters = &.{"cache capacity:"} })).step);
+     b.step("test-snap-fork-host", "CUDA prompt-cache rules: no fork marks unless a family sets snap_fork, its marks when it does").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = native, .filters = &.{"snap fork:"} })).step);
+     b.step("test-snap-hooks-host", "CUDA prompt-cache hooks: a family's spare, trim and reuses reach the store").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = native, .filters = &.{"snap hooks:"} })).step);
+diff --git a/zig/src/cuda/arena.zig b/zig/src/cuda/arena.zig
+index a3f6273..33716f8 100644
+--- a/zig/src/cuda/arena.zig
++++ b/zig/src/cuda/arena.zig
+@@ -236,6 +236,14 @@ pub const Vmm = struct {
+ 
+     /// `va_bytes` of virtual addresses reserved (cheap: no memory behind them until a chunk maps).
+     pub fn open(d: *const Driver, device: abi.Device, va_bytes: usize) Error!Vmm {
++        var v = try load(d, device);
++        errdefer v.close();
++        try v.reserveRange(va_bytes);
++        return v;
++    }
++
++    /// Read the CUDA granularity before sizing the virtual address layout.
++    pub fn load(d: *const Driver, device: abi.Device) Error!Vmm {
+         var vmm_ok: c_int = 0;
+         if (d.api.cuDeviceGetAttribute(&vmm_ok, .virtual_memory_management_supported, device) != abi.success or vmm_ok == 0) return error.Unsupported; // VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED
+         var lib = std.DynLib.open("libcuda.so.1") catch return error.DriverUnavailable;
+@@ -249,17 +257,59 @@ pub const Vmm = struct {
+         var g: usize = 0;
+         if (api.granularity(&g, &prop, 1) != abi.success or g == 0) return error.Unsupported; // RECOMMENDED
+         g = @max(g, 2 << 20);
+-        const len = std.mem.alignForward(usize, va_bytes, g);
++        return .{ .lib = lib, .device = device, .prop = prop, .granularity = g, .api = api };
++    }
++
++    pub fn reserveRange(v: *Vmm, va_bytes: usize) Error!void {
++        if (v.va_len != 0 or va_bytes == 0) return error.Unsupported;
++        const len = std.mem.alignForward(usize, va_bytes, v.granularity);
+         var va: u64 = 0;
+-        if (api.reserve(&va, len, g, 0, 0) != abi.success) return error.CudaFailed;
+-        return .{ .lib = lib, .device = device, .prop = prop, .granularity = g, .va = va, .va_len = len, .next = va, .api = api };
++        if (v.api.reserve(&va, len, v.granularity, 0, 0) != abi.success) return error.CudaFailed;
++        v.va = va;
++        v.va_len = len;
++        v.next = va;
+     }
+ 
+     pub fn close(v: *Vmm) void {
+-        _ = v.api.addressFree(v.va, v.va_len);
++        if (v.va_len != 0) _ = v.api.addressFree(v.va, v.va_len);
+         v.lib.close();
+     }
+ 
++    /// One charge for a physical allocation retained across several mappings.
++    pub fn allocPhysical(v: *Vmm, d: *const Driver, len: usize) !u64 {
++        try memory.PhysicalCharge.reserve(len);
++        errdefer memory.PhysicalCharge.finish(len, false);
++        var handle: u64 = 0;
++        try d.check(v.api.create(&handle, len, &v.prop, 0), "cuMemCreate");
++        memory.PhysicalCharge.finish(len, true);
++        return handle;
++    }
++
++    pub fn freePhysical(v: *Vmm, handle: u64, len: usize) void {
++        const rc = v.api.release(handle);
++        if (rc == abi.success) {
++            memory.PhysicalCharge.release(len);
++        } else if (!quiet) {
++            std.log.err("cuMemRelease failed ({d})", .{rc});
++        }
++    }
++
++    pub fn mapPhysical(v: *Vmm, d: *const Driver, addr: u64, len: usize, handle: u64) !void {
++        return v.mapPhysicalAccess(d, addr, len, handle, false);
++    }
++
++    /// mapPhysical, read-only when `read_only` (CU_MEM_ACCESS_FLAGS_PROT_READ): a write through it faults.
++    pub fn mapPhysicalAccess(v: *Vmm, d: *const Driver, addr: u64, len: usize, handle: u64, read_only: bool) !void {
++        try d.check(v.api.map(addr, len, 0, handle, 0), "cuMemMap");
++        errdefer _ = v.api.unmap(addr, len);
++        const desc: AccessDesc = .{ .loc_id = v.device, .flags = if (read_only) 1 else 3 };
++        try d.check(v.api.setAccess(addr, len, &desc, 1), "cuMemSetAccess");
++    }
++
++    pub fn unmapPhysical(v: *Vmm, d: *const Driver, addr: u64, len: usize) !void {
++        try d.check(v.api.unmap(addr, len), "cuMemUnmap");
++    }
++
+     pub fn backend(v: *Vmm) Backend {
+         return .{ .ctx = v, .granularity = v.granularity, .chunk = chunk, .release = release, .name = "vmm" };
+     }
+diff --git a/zig/src/cuda/memory.zig b/zig/src/cuda/memory.zig
+index 3685228..0335b2d 100644
+--- a/zig/src/cuda/memory.zig
++++ b/zig/src/cuda/memory.zig
+@@ -44,6 +44,21 @@ fn finishAllocation(counter: ?*std.atomic.Value(u64), n: usize) void {
+     if (counter) |c| recordAllocation(c, n);
+ }
+ 
++/// An allocation made by VMM counts once, regardless of how many virtual addresses map it.
++pub const PhysicalCharge = struct {
++    pub fn reserve(bytes: usize) Error!void {
++        try reserveAllocation(bytes);
++    }
++
++    pub fn finish(bytes: usize, allocated: bool) void {
++        finishAllocation(if (allocated) &device_bytes else null, bytes);
++    }
++
++    pub fn release(bytes: usize) void {
++        freed(&device_bytes, bytes);
++    }
++};
++
+ /// The counts now; `reset_peak` starts a new peak at the current device and pinned bytes. Safe from any thread.
+ pub fn usage(reset_peak: bool) Usage {
+     const NoHook = struct {
+diff --git a/zig/src/families/inkling2/inkling2.zig b/zig/src/families/inkling2/inkling2.zig
+index dc455b0..334c04c 100644
+--- a/zig/src/families/inkling2/inkling2.zig
++++ b/zig/src/families/inkling2/inkling2.zig
+@@ -37,6 +37,7 @@ test {
+     _ = mini_dflash;
+     _ = mini_backend;
+     _ = mini_snap;
++    _ = @import("mini_pages.zig");
+     _ = mini_image;
+     _ = mini_vision;
+     _ = mini_ref;
+diff --git a/zig/src/families/inkling2/mini_backend.zig b/zig/src/families/inkling2/mini_backend.zig
+index 88d17b2..058ffc1 100644
+--- a/zig/src/families/inkling2/mini_backend.zig
++++ b/zig/src/families/inkling2/mini_backend.zig
+@@ -353,6 +353,8 @@ pub const Mini = struct {
+         }
+         s.cached = 0;
+         l.fill = x.resumeAt(s, l, p.len);
++        // shared KV: a prompt from its start holds no pages yet (a restored one holds its snapshot's)
++        if (l.fill.? == 0) if (x.m.pages) |pg| try pg.releaseSlot(x.s, l.slot, pg.keep);
+         if (x.vision) |v| {
+             if (s.images.len > 0) {
+                 try v.begin(&x.k.ops, x.s, l.slot, s.images, l.fill.?);
+@@ -725,6 +727,8 @@ pub const Mini = struct {
+         if (x.lanes.fetchRemove(s)) |entry| {
+             var l = entry.value;
+             if (x.vision) |v| v.clear(l.slot);
++            // shared KV: the stream's pages go back to the pool (its snapshots keep theirs)
++            if (x.m.pages) |pg| pg.releaseSlot(x.s, l.slot, pg.keep) catch |e| std.log.err("Inkling 2 Mini: releasing slot {d}'s KV pages: {s}", .{ l.slot, @errorName(e) });
+             x.free[l.slot] = true;
+             l.rows.deinit(x.gpa);
+         }
+diff --git a/zig/src/families/inkling2/mini_model.zig b/zig/src/families/inkling2/mini_model.zig
+index 785c243..c6eb27b 100644
+--- a/zig/src/families/inkling2/mini_model.zig
++++ b/zig/src/families/inkling2/mini_model.zig
+@@ -9,6 +9,7 @@ const ops = @import("ops.zig");
+ const loop = @import("loop.zig");
+ const visit = @import("mini_visit.zig");
+ const mini_vision = @import("mini_vision.zig");
++const mini_pages = @import("mini_pages.zig");
+ 
+ const DeviceBuffer = cuda.DeviceBuffer;
+ 
+@@ -190,6 +191,10 @@ pub const Model = struct {
+     kv8: bool = false, // --kv-cache fp8: codes, and an fp32 scale a (slot, key head, position) in `kvs`
+     kvs: [2][config.max_visits]u64 = @splat(@splat(0)), // kv8: a visit's K and V scales [slots][kv][len]
+     conv: [config.max_visits][4]u64 = undefined, // a visit's conv states: fp32 [slots][3][C] by Site
++    /// TF_INKLING2_SHARED_KV=1: the whole caches on VMM pages a stream maps as it writes (mini_pages.zig).
++    shared_kv: bool = false,
++    pages: ?*mini_pages.Pages = null,
++    device: cuda.abi.Device = 0,
+     s: Scratch = undefined,
+     buffers: std.ArrayList(DeviceBuffer) = .empty,
+     planned: ?usize = null, // a plan: the bytes counted, nothing allocated
+@@ -250,9 +255,10 @@ pub const Model = struct {
+         return p;
+     }
+ 
+-    fn blank(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const wts.Weights, context: usize, slots: usize, kv8: bool) Model {
++    fn blank(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const wts.Weights, context: usize, slots: usize, kv8: bool, shared_kv: bool) Model {
+         return .{
+             .kv8 = kv8,
++            .shared_kv = shared_kv,
+             .gpa = gpa,
+             .d = d,
+             .w = w,
+@@ -271,17 +277,19 @@ pub const Model = struct {
+     }
+ 
+     /// The caches and scratch of `slots` streams at `context` positions.
+-    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, s: cuda.Stream, w: *const wts.Weights, k: *const Kernels, context: usize, slots: usize, kv8: bool) !Model {
+-        var m = blank(gpa, d, w, context, slots, kv8);
++    /// `shared_kv`: the whole caches on pages (`device` reserves their addresses), not allocated per slot.
++    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, s: cuda.Stream, w: *const wts.Weights, k: *const Kernels, context: usize, slots: usize, kv8: bool, shared_kv: bool, device: cuda.abi.Device) !Model {
++        var m = blank(gpa, d, w, context, slots, kv8, shared_kv);
++        m.device = device;
+         errdefer m.deinit();
+         try m.build(s, k);
+         try s.synchronize();
+         return m;
+     }
+ 
+-    /// The device bytes init would allocate.
+-    pub fn openBytes(gpa: std.mem.Allocator, d: *const cuda.Driver, s: cuda.Stream, w: *const wts.Weights, k: *const Kernels, context: usize, slots: usize, kv8: bool) !usize {
+-        var m = blank(gpa, d, w, context, slots, kv8);
++    /// The device bytes init would allocate (with `shared_kv`, none for the whole caches: they are leased pages).
++    pub fn openBytes(gpa: std.mem.Allocator, d: *const cuda.Driver, s: cuda.Stream, w: *const wts.Weights, k: *const Kernels, context: usize, slots: usize, kv8: bool, shared_kv: bool) !usize {
++        var m = blank(gpa, d, w, context, slots, kv8, shared_kv);
+         m.planned = 0;
+         try m.build(s, k);
+         return m.planned.?;
+@@ -292,7 +300,7 @@ pub const Model = struct {
+         const t = m.c;
+         const kvw: usize = @as(usize, t.local.kv) * t.local.dim;
+         const v = &m.w.plan.visits;
+-        const caches = v.count(.sliding) * m.sliding.ring + v.count(.full) * m.full.ring;
++        const caches = v.count(.sliding) * m.sliding.ring + if (m.shared_kv) 0 else v.count(.full) * m.full.ring;
+         const per: usize = if (m.kv8) kvw + 4 * @as(usize, t.local.kv) else kvw * 2; // a position's K (or V) bytes
+         return caches * per * 2 + 2 * v.count(.conv) * 3 * (2 * kvw + 2 * @as(usize, t.hidden)) * 4;
+     }
+@@ -309,15 +317,41 @@ pub const Model = struct {
+         };
+         for (m.buffers.items) |*b| b.free();
+         m.buffers.deinit(m.gpa);
++        if (m.pages) |p| p.deinit();
++        m.pages = null;
++    }
++
++    /// Shared KV: bytes of one stream's whole pages below `rows` (what a snapshot at `rows` shares instead of copying).
++    pub fn pageBytes(m: *const Model, rows: usize) usize {
++        const p = m.pages orelse return 0;
++        return p.g.slotPlanes() * p.snapPages(rows) * p.g.page_bytes;
++    }
++
++    /// Shared KV: the first position of the page holding `rows` (a snapshot copies the rows from there to `rows`).
++    pub fn pageStart(m: *const Model, rows: usize) usize {
++        const p = m.pages orelse return rows;
++        return @min(rows, p.snapPages(rows) * p.g.rowsPerPage()); // share_partial: nothing to copy
+     }
+ 
+     fn build(m: *Model, s: cuda.Stream, k: *const Kernels) !void {
+         const t = m.c;
+         const kvw: usize = @as(usize, t.local.kv) * t.local.dim;
+         var widths: usize = 0; // fp32 columns of every site of every visit
++        if (m.shared_kv) {
++            if (m.kv8) return error.Inkling2SharedKvFp8;
++            if (@as(usize, t.local.dim) * 2 != mini_pages.row_bytes) return error.Inkling2PagesUnaligned;
++            if (m.planned == null) m.pages = try mini_pages.Pages.open(m.gpa, m.d, m.device, m.w.plan.visits.count(.full), m.slots, t.local.kv, m.full.ring);
++        }
++        var fulls: usize = 0;
+         for (m.w.plan.visits.slice(), 0..) |step, i| {
+-            const len: usize = if (step.of(.full) != null) m.full.ring else m.sliding.ring;
++            const full = step.of(.full) != null;
++            const len: usize = if (full) m.full.ring else m.sliding.ring;
++            defer fulls += @intFromBool(full);
+             for (0..2) |side| {
++                if (full and m.shared_kv) {
++                    m.kv[side][i] = if (m.pages) |p| p.base(fulls, side) else 0;
++                    continue;
++                }
+                 m.kv[side][i] = try m.alloc(m.slots * len * kvw * @as(usize, if (m.kv8) 1 else 2));
+                 if (m.kv8) m.kvs[side][i] = try m.alloc(m.slots * len * @as(usize, t.local.kv) * 4);
+             }
+@@ -624,6 +658,8 @@ pub const Model = struct {
+         if (rows == 0 or rows > @as(usize, if (prompt) prompt_rows else round_rows) or (prompt and chains.len != 1)) return error.TooManyRows;
+         if (chains.len > round_rows or heads > round_rows or head0 + heads > rows) return error.TooManyRows;
+         for (chains) |ch| if (ch.p0 == 0) try m.clear(s, ch.slot);
++        // shared KV: the pages each chain's rows write are the slot's own before any launch (or graph replay)
++        if (m.pages) |p| for (chains) |ch| try p.ensure(s, ch.slot, ch.p0, ch.p0 + ch.tokens.len);
+         m.gen += 1;
+         var r = try visit.Rows.stage(m, s, chains, rows, prompt);
+         if (m.lazyFor(heads)) try m.upload(s, m.lazy.?.info, std.mem.sliceAsBytes(m.lazy_rows[0..heads]));
+diff --git a/zig/src/families/inkling2/mini_native.zig b/zig/src/families/inkling2/mini_native.zig
+index 11038a3..c8c7222 100644
+--- a/zig/src/families/inkling2/mini_native.zig
++++ b/zig/src/families/inkling2/mini_native.zig
+@@ -11,6 +11,7 @@ const snap = @import("mini_snap.zig");
+ const dspark = @import("mini_dspark.zig");
+ const dflash = @import("mini_dflash.zig");
+ const mini_vision = @import("mini_vision.zig");
++const mini_pages = @import("mini_pages.zig");
+ 
+ pub const model_type = "inkling2_loop";
+ pub const formats: []const []const u8 = &.{"modelopt-nvfp4"};
+@@ -41,8 +42,17 @@ pub const Loaded = struct {
+     deinit: *const fn (*anyopaque) void,
+     target: *be.Mini,
+     vision: ?*mini_vision.Images = null,
++    /// TF_INKLING2_SHARED_KV=1: whole caches on pages leased per request through the server's KV ledger.
++    shared_pages: ?struct { fixed_bytes: u64, scratch: u64, token_bytes: u64, page_tokens: u32, lookahead: u32 } = null,
+ };
+ 
++/// TF_INKLING2_SHARED_KV=1: the whole caches on VMM pages each stream maps as it writes (mini_pages.zig), leased per
++/// request, so --parallel 8 streams share one budget instead of each holding a whole window; snapshots share pages.
++fn sharedKvOn() bool {
++    const v = std.c.getenv("TF_INKLING2_SHARED_KV") orelse return false;
++    return v[0] == '1';
++}
++
+ const Owned = struct { gpa: std.mem.Allocator, w: wts.Weights, k: mm.Kernels, x: be.Draws, s: cuda.Stream, m: mm.Model, b: be.Mini, v: ?*mini_vision.Images = null };
+ 
+ /// Streams to allocate in `room`: as asked, else (auto) the most that fit; a fixed count past them refuses.
+@@ -62,10 +72,11 @@ const Plan = struct {
+     d: *const cuda.Driver,
+     context: usize,
+     kv8: bool,
++    shared_kv: bool,
+ 
+     fn bytes(p: Plan, n: usize) !u64 {
+         const o = p.own;
+-        return try mm.Model.openBytes(o.gpa, p.d, o.s, &o.w, &o.k, p.context, n, p.kv8) + be.Mini.openBytes(o.w.config.text.unpadded_vocab, o.w.config.text.vocab, n);
++        return try mm.Model.openBytes(o.gpa, p.d, o.s, &o.w, &o.k, p.context, n, p.kv8, p.shared_kv) + be.Mini.openBytes(o.w.config.text.unpadded_vocab, o.w.config.text.vocab, n);
+     }
+ };
+ 
+@@ -80,7 +91,9 @@ fn refuse(kernels: ?[]const u8, o: Options) !void {
+ /// The checkpoint, the kernels and every stream's caches.
+ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: ?[]const u8, o: Options) !Loaded {
+     try refuse(kernels, o);
+-    const context = try be.capacity(o.context);
++    const shared_kv = sharedKvOn();
++    if (shared_kv and o.kv8) return error.Inkling2SharedKvFp8;
++    const context = if (shared_kv) mini_pages.alignContext(try be.capacity(o.context)) else try be.capacity(o.context);
+     const own = try gpa.create(Owned);
+     errdefer gpa.destroy(own);
+     own.gpa = gpa;
+@@ -93,7 +106,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+     errdefer own.x.deinit();
+     own.s = try cuda.Stream.init(ctx.d, false);
+     errdefer own.s.deinit();
+-    const plan: Plan = .{ .own = own, .d = ctx.d, .context = context, .kv8 = o.kv8 };
++    const plan: Plan = .{ .own = own, .d = ctx.d, .context = context, .kv8 = o.kv8, .shared_kv = shared_kv };
+     const room: u64 = if (o.room) |r| r.read(r.ctx) orelse 0 else std.math.maxInt(u64);
+     const n = fit(room, o.lanes, o.lanes_fixed, plan) catch |e| {
+         if (e == error.ParallelPastMemory) {
+@@ -102,7 +115,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+         }
+         return e;
+     };
+-    own.m = try mm.Model.init(gpa, ctx.d, own.s, &own.w, &own.k, context, n, o.kv8);
++    own.m = try mm.Model.init(gpa, ctx.d, own.s, &own.w, &own.k, context, n, o.kv8, shared_kv, ctx.device);
+     errdefer own.m.deinit();
+     own.b = try be.Mini.init(gpa, ctx.d, &own.m, &own.k, &own.x, own.s, own.w.config.image_token);
+     errdefer own.b.deinit();
+@@ -110,6 +123,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+     own.m.vision = own.v;
+     own.b.vision = own.v;
+     if (own.v) |vis| std.log.info("Inkling 2 Mini vision: {d} layers, {d:.2} GiB weights, up to {d} image tokens / {d} images", .{ vis.c.layers, gib(vis.w.bytes), vis.limits.image_tokens, vis.limits.max_images });
++    if (own.m.pages) |p| std.log.info("Inkling 2 Mini shared KV: whole caches on {d} MiB pages, {d} positions a page, {d:.2} GiB a full window, leased per request", .{ p.g.page_bytes >> 20, p.g.rowsPerPage(), gib(p.g.bytesAt(context)) });
+     std.log.info("Inkling 2 Mini: {d} visits a token ({d} sliding, {d} full, {d} conv slots a stream), {d} streams of {d} positions ({s} caches), {d:.2} GiB of weights", .{ own.w.plan.visits.len, own.w.plan.visits.count(.sliding), own.w.plan.visits.count(.full), own.w.plan.visits.count(.conv), n, context, if (o.kv8) "fp8" else "bf16", gib(own.w.bytes) });
+     return .{
+         .backend = own.b.backend(),
+@@ -121,6 +135,13 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+         .deinit = release,
+         .target = &own.b,
+         .vision = own.v,
++        .shared_pages = if (own.m.pages) |p| .{
++            .fixed_bytes = 0, // every stream's own state is allocated already
++            .scratch = (1 + mini_pages.pool_cap + p.g.slots * p.g.slotPlanes() * p.keep) * p.g.page_bytes, // zero page, pool, kept slot pages
++            .token_bytes = p.g.bytesAt(1) / p.g.rowsPerPage(),
++            .page_tokens = @intCast(p.g.rowsPerPage()),
++            .lookahead = be.verify_rows,
++        } else null,
+     };
+ }
+ 
+@@ -184,6 +205,17 @@ pub fn snap_drop(ptr: *anyopaque, saved: *anyopaque) void {
+     mini(ptr).dropState(@ptrCast(@alignCast(saved)));
+ }
+ 
++/// Shared KV: a state is charged its copies and the pages no earlier kept state holds (snap_bytes stays the bound).
++pub fn snap_charged(ptr: *anyopaque, saved: *anyopaque) u64 {
++    _ = ptr;
++    return snap.charged(@ptrCast(@alignCast(saved)));
++}
++
++/// Shared KV: pages kept states hold after the state charged for them was dropped, inside the cache's budget.
++pub fn snap_spare(ptr: *anyopaque) u64 {
++    return snap.spare(mini(ptr).m);
++}
++
+ /// Whether a request's caches could start now (the lane host's admission, on its engine thread).
+ pub fn fits(p: *anyopaque, prompt: u32, max_tokens: u32) bool {
+     const own: *const Owned = @ptrCast(@alignCast(p));
+@@ -197,6 +229,8 @@ fn gib(b: u64) f64 {
+ /// A request or load this engine refuses, in words; null: none of its own.
+ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
+     return switch (err) {
++        error.Inkling2SharedKvFp8 => "TF_INKLING2_SHARED_KV=1 pages bf16 whole caches only: serve with --kv-cache bf16, or unset TF_INKLING2_SHARED_KV",
++        error.Inkling2PagesUnaligned => "TF_INKLING2_SHARED_KV=1: this GPU's VMM page size does not divide a cache plane",
+         error.Inkling2MiniLoopsFixed => "--loops: Inkling 2 Mini runs the passes its loop_config names (3 over layers 6 to 17); serve without --loops",
+         error.Inkling2MiniImages => "images: serve with --vision to enable Inkling 2 Mini's vision tower, or send text parts only",
+         error.Inkling2VisionLimits => "--vision: --vision-image-tokens and --vision-max-images must both be positive",
+diff --git a/zig/src/families/inkling2/mini_pages.zig b/zig/src/families/inkling2/mini_pages.zig
+new file mode 100644
+index 0000000..32978bb
+--- /dev/null
++++ b/zig/src/families/inkling2/mini_pages.zig
+@@ -0,0 +1,667 @@
++//! Inkling 2 Mini's whole (global) caches on CUDA VMM pages (TF_INKLING2_SHARED_KV=1): the model's own layout, a
++//! visit's K or V at [slots][kv][ring][128] bf16, behind one reserved address range, so every kernel and graph sees
++//! the addresses and strides it always had. Each page is either the shared zero page (mapped read-only: a page no
++//! stream has written yet) or a physical page of its own, made when a forward is about to write its rows (`ensure`).
++//! A prompt snapshot keeps its pages by reference instead of copying them; a later write to a page a snapshot holds
++//! copies that page first (copy on write). Streams therefore hold only the pages their rows reach, and the server's
++//! ledger leases them per request (lanes share one budget instead of each reserving a whole window).
++const std = @import("std");
++const cuda = @import("cuda");
++const A = std.mem.Allocator;
++
++/// Bytes a cached position takes in one K or V plane (a key head's 128 bf16).
++pub const row_bytes = 2 * 128;
++
++/// A slot's window, in positions, rounded up so each plane is whole pages (up to 4 MiB pages).
++pub fn alignContext(context: usize) usize {
++    return std.mem.alignForward(usize, context, (4 << 20) / row_bytes);
++}
++
++pub const Geometry = struct {
++    visits: usize, // whole-cache visits (Mini: 8)
++    slots: usize,
++    heads: usize, // key heads (Mini: 8)
++    ring: usize, // positions a plane holds
++    page_bytes: usize,
++
++    pub fn pagesPerPlane(g: Geometry) usize {
++        return g.ring * row_bytes / g.page_bytes;
++    }
++
++    /// Planes of one slot: each visit's K and V for every key head.
++    pub fn slotPlanes(g: Geometry) usize {
++        return g.visits * 2 * g.heads;
++    }
++
++    pub fn planes(g: Geometry) usize {
++        return g.slotPlanes() * g.slots;
++    }
++
++    pub fn rowsPerPage(g: Geometry) usize {
++        return g.page_bytes / row_bytes;
++    }
++
++    pub fn pagesFor(g: Geometry, rows: usize) usize {
++        return std.math.divCeil(usize, rows, g.rowsPerPage()) catch unreachable;
++    }
++
++    /// The plane of (visit, side, slot, head) in the model's order: visit, then side, then [slots][kv].
++    pub fn plane(g: Geometry, visit: usize, side: usize, slot: usize, head: usize) usize {
++        return ((visit * 2 + side) * g.slots + slot) * g.heads + head;
++    }
++
++    /// The `j`th plane of `slot` (its visits, sides and heads in order).
++    pub fn slotPlane(g: Geometry, slot: usize, j: usize) usize {
++        const head = j % g.heads;
++        const side = (j / g.heads) % 2;
++        const visit = j / (2 * g.heads);
++        return g.plane(visit, side, slot, head);
++    }
++
++    pub fn pageIndex(g: Geometry, p: usize, page: usize) usize {
++        return p * g.pagesPerPlane() + page;
++    }
++
++    /// Device bytes of a slot's pages through `rows` positions (a lease's or a snapshot's charge).
++    pub fn bytesAt(g: Geometry, rows: usize) usize {
++        return g.slotPlanes() * g.pagesFor(rows) * g.page_bytes;
++    }
++};
++
++const Page = struct {
++    handle: u64,
++    refs: std.atomic.Value(usize) = .init(1),
++    // the prompt cache's charge (under Pages.pool_lock): snapshots holding the page, and the one charged for it
++    // (0: none; `orphan`: its charged snapshot was dropped while others still hold it, counted in Pages.orphan_bytes)
++    snaps: u32 = 0,
++    owner: u64 = 0,
++
++    fn retain(p: *Page) void {
++        _ = p.refs.fetchAdd(1, .monotonic);
++    }
++
++    /// The last holder gives the physical page back to `pages` (its pool, else the driver).
++    fn release(page: *Page, pages: *Pages) void {
++        if (page.refs.fetchSub(1, .acq_rel) != 1) return;
++        pages.recycle(page.handle);
++        pages.a.destroy(page);
++    }
++};
++
++/// Released physical pages kept for reuse (no cuMemCreate/cuMemRelease on the serving path), at most this many: they
++/// are charged to the ledger's scratch, beside the zero page.
++pub const pool_cap = 128;
++/// Pages a copy-on-write batch makes private with one stream synchronize (a slot's planes: one page each).
++pub const batch = 128;
++
++/// Page.owner of a page whose charged snapshot is gone while other snapshots still hold it.
++const orphan = std.math.maxInt(u64);
++
++/// A slot's whole pages below `at` positions, held by reference (a prompt snapshot's whole caches; the rows of a partly
++/// filled last page are copied with the state, so a slot never writes into a page a snapshot holds). `charged`: the
++/// bytes of the pages no other snapshot held when it was made (each physical page is charged to one snapshot only).
++pub const Snapshot = struct {
++    from: *Pages,
++    at: usize,
++    pages: []*Page, // slotPlanes x pagesFor(at), plane-major
++    id: u64,
++    charged: usize,
++
++    /// Needs the engine's CUDA context current on the calling thread (a last release may free a physical page).
++    pub fn deinit(s: Snapshot) void {
++        const p = s.from;
++        p.lockPool();
++        for (s.pages) |page| {
++            page.snaps -= 1;
++            if (page.owner == s.id) {
++                if (page.snaps > 0) { // still held by later snapshots: its bytes stay in the budget as spare
++                    page.owner = orphan;
++                    p.orphan_bytes += p.g.page_bytes;
++                } else page.owner = 0;
++            } else if (page.owner == orphan and page.snaps == 0) {
++                page.owner = 0;
++                p.orphan_bytes -= p.g.page_bytes;
++            }
++        }
++        p.unlockPool();
++        for (s.pages) |page| page.release(p);
++        p.a.free(s.pages);
++    }
++};
++
++pub const Pages = struct {
++    a: A,
++    d: *const cuda.Driver,
++    vmm: cuda.arena.Vmm,
++    g: Geometry,
++    mapped: []?*Page, // null: the zero page
++    zero: u64, // the zero page's physical handle
++    read_only: bool, // the zero page is mapped read-only (a stray write faults instead of spreading)
++    pool: [pool_cap]u64 = undefined, // released physical pages kept for reuse
++    pooled: usize = 0,
++    // guards the pool and the cache's charge (snaps, owner, orphan_bytes). A snapshot may be dropped on another thread
++    // than the engine's, but with the engine's CUDA context current: a release past the pool frees physical memory.
++    pool_lock: std.atomic.Value(bool) = .init(false),
++    next_snapshot: u64 = 1,
++    /// Bytes of pages that only snapshots hold whose charged snapshot was dropped: the prompt cache counts them as its
++    /// family's spare storage, so its budget always covers every page a kept state holds.
++    orphan_bytes: usize = 0,
++    /// Pages a plane each slot keeps between its prompts (TF_INKLING2_SLOT_PAGES, default 1: its first 8,192 positions),
++    /// charged to the ledger's scratch; a short prompt then maps nothing.
++    keep: usize = 1,
++    /// TF_INKLING2_SNAP_SHARE_PARTIAL=1 (dev: to exercise copy on write): snapshots hold the partly filled last page too
++    /// instead of copying its rows, so a restored slot's first write copies that page.
++    share_partial: bool = false,
++    trace: bool = false,
++    stats: struct { ns: [3]u64 = @splat(0), calls: [3]u64 = @splat(0), fresh: u64 = 0, copies: u64 = 0, released: u64 = 0 } = .{},
++
++    /// Reserve every plane's addresses and map the zero page under each of its pages.
++    pub fn open(a: A, d: *const cuda.Driver, device: cuda.abi.Device, visits: usize, slots: usize, heads: usize, ring: usize) !*Pages {
++        const p = try a.create(Pages);
++        errdefer a.destroy(p);
++        var vmm = try cuda.arena.Vmm.load(d, device);
++        errdefer vmm.close();
++        const g: Geometry = .{ .visits = visits, .slots = slots, .heads = heads, .ring = ring, .page_bytes = vmm.granularity };
++        if (ring * row_bytes % g.page_bytes != 0) return error.Inkling2PagesUnaligned;
++        const mapped = try a.alloc(?*Page, g.planes() * g.pagesPerPlane());
++        errdefer a.free(mapped);
++        @memset(mapped, null);
++        // `batch` more pages of addresses: the copy targets while pages turn private
++        try vmm.reserveRange((mapped.len + batch) * g.page_bytes);
++        p.* = .{ .a = a, .d = d, .vmm = vmm, .g = g, .mapped = mapped, .zero = 0, .read_only = true };
++        if (std.c.getenv("TF_INKLING2_SLOT_PAGES")) |v| p.keep = @min(g.pagesPerPlane(), std.fmt.parseInt(usize, std.mem.span(v), 10) catch 1);
++        p.trace = if (std.c.getenv("TF_INKLING2_PAGES_TRACE")) |v| v[0] == '1' else false;
++        p.share_partial = if (std.c.getenv("TF_INKLING2_SNAP_SHARE_PARTIAL")) |v| v[0] == '1' else false;
++        p.zero = try p.vmm.allocPhysical(d, g.page_bytes);
++        errdefer p.vmm.freePhysical(p.zero, g.page_bytes);
++        {
++            // clear the zero page through the copy address once
++            const copy_va = p.address(mapped.len);
++            try p.vmm.mapPhysical(d, copy_va, g.page_bytes, p.zero);
++            defer p.vmm.unmapPhysical(d, copy_va, g.page_bytes) catch {};
++            try d.check(d.api.cuMemsetD8_v2(copy_va, 0, g.page_bytes), "clear the Inkling zero page");
++            try d.check(d.api.cuCtxSynchronize(), "clear the Inkling zero page"); // the memset is asynchronous
++        }
++        var done: usize = 0;
++        errdefer for (0..done) |i| p.vmm.unmapPhysical(d, p.address(i), g.page_bytes) catch {};
++        for (0..mapped.len) |i| {
++            try p.mapZero(i);
++            done += 1;
++        }
++        return p;
++    }
++
++    pub fn deinit(p: *Pages) void {
++        // the prompt cache drops its states first (cuda_host_close): spare bytes left here are a charge gone astray
++        if (p.orphan_bytes != 0) std.log.warn("Inkling KV pages: {d} MiB of kept states' pages still charged as spare at close", .{p.orphan_bytes >> 20});
++        _ = p.d.api.cuCtxSynchronize();
++        for (0..p.mapped.len) |i| {
++            p.vmm.unmapPhysical(p.d, p.address(i), p.g.page_bytes) catch {};
++            if (p.mapped[i]) |page| page.release(p);
++        }
++        for (p.pool[0..p.pooled]) |h| p.vmm.freePhysical(h, p.g.page_bytes);
++        p.vmm.freePhysical(p.zero, p.g.page_bytes);
++        p.a.free(p.mapped);
++        p.vmm.close();
++        p.a.destroy(p);
++    }
++
++    /// The model's base address of (visit, side): [slots][kv][ring][128].
++    pub fn base(p: *const Pages, visit: usize, side: usize) u64 {
++        return p.address(p.g.pageIndex(p.g.plane(visit, side, 0, 0), 0));
++    }
++
++    fn address(p: *const Pages, index: usize) u64 {
++        return p.vmm.va + index * p.g.page_bytes;
++    }
++
++    fn mapZero(p: *Pages, index: usize) !void {
++        const at = p.address(index);
++        if (p.read_only) {
++            p.vmm.mapPhysicalAccess(p.d, at, p.g.page_bytes, p.zero, true) catch {
++                // a driver without read-only device mappings: the zero page stays writable (nothing writes it)
++                p.read_only = false;
++                return p.vmm.mapPhysical(p.d, at, p.g.page_bytes, p.zero);
++            };
++            return;
++        }
++        try p.vmm.mapPhysical(p.d, at, p.g.page_bytes, p.zero);
++    }
++
++    pub fn lockPool(p: *Pages) void {
++        while (p.pool_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
++    }
++
++    pub fn unlockPool(p: *Pages) void {
++        p.pool_lock.store(false, .release);
++    }
++
++    /// A released physical page: kept in the pool while it has room, else given back to the driver.
++    fn recycle(p: *Pages, handle: u64) void {
++        p.lockPool();
++        if (p.pooled < pool_cap) {
++            p.pool[p.pooled] = handle;
++            p.pooled += 1;
++            p.unlockPool();
++            return;
++        }
++        p.unlockPool();
++        p.vmm.freePhysical(handle, p.g.page_bytes);
++    }
++
++    fn newPage(p: *Pages) !*Page {
++        const page = try p.a.create(Page);
++        errdefer p.a.destroy(page);
++        p.lockPool();
++        const pooled: ?u64 = if (p.pooled > 0) blk: {
++            p.pooled -= 1;
++            break :blk p.pool[p.pooled];
++        } else null;
++        p.unlockPool();
++        page.* = .{ .handle = pooled orelse try p.vmm.allocPhysical(p.d, p.g.page_bytes) };
++        return page;
++    }
++
++    fn temp(p: *const Pages, k: usize) u64 {
++        return p.address(p.mapped.len + k);
++    }
++
++    /// Back each page of `indices` (at most `batch`) with a page of its own. A shared page's rows are copied first (all
++    /// copies queued, then one synchronize); an unwritten one (the zero page) takes a page as it comes, as a cuMemAlloc'd
++    /// cache would: its rows are written before any is read. The stream is idle on entry.
++    fn privatize(p: *Pages, s: cuda.Stream, indices: []const usize) !void {
++        const len = p.g.page_bytes;
++        var news: [batch]*Page = undefined;
++        var copied: [batch]bool = @splat(false); // mapped at its copy address
++        var made: usize = 0;
++        var placed: usize = 0;
++        errdefer {
++            s.synchronize() catch {};
++            for (news[placed..made], copied[placed..made], placed..) |n, c, k| {
++                if (c) p.vmm.unmapPhysical(p.d, p.temp(k), len) catch {};
++                n.release(p);
++            }
++        }
++        var copies: usize = 0;
++        for (indices, 0..) |i, k| {
++            const n = try p.newPage();
++            news[k] = n;
++            made += 1;
++            if (p.mapped[i] == null) continue;
++            try p.vmm.mapPhysical(p.d, p.temp(k), len, n.handle);
++            copied[k] = true;
++            try p.d.check(p.d.api.cuMemcpyDtoDAsync_v2(p.temp(k), p.address(i), len, s.handle), "copy an Inkling KV page");
++            copies += 1;
++        }
++        if (copies > 0) try s.synchronize();
++        for (indices, 0..) |i, k| {
++            if (copied[k]) try p.vmm.unmapPhysical(p.d, p.temp(k), len);
++            copied[k] = false;
++            try p.vmm.unmapPhysical(p.d, p.address(i), len);
++            if (p.mapped[i]) |old| old.release(p); // a shared page: its other holders keep it
++            p.mapped[i] = null;
++            placed += 1; // from here the new page is this index's (or freed below), not the errdefer's
++            p.vmm.mapPhysical(p.d, p.address(i), len, news[k].handle) catch |e| {
++                news[k].release(p);
++                p.mapZero(i) catch {};
++                return e;
++            };
++            p.mapped[i] = news[k];
++        }
++        p.stats.fresh += made;
++        p.stats.copies += copies;
++    }
++
++    /// `slot`'s positions [start, end) are about to be written: each page they reach becomes the slot's own.
++    pub fn ensure(p: *Pages, s: cuda.Stream, slot: usize, start: usize, end: usize) !void {
++        if (start >= end) return;
++        if (end > p.g.ring or slot >= p.g.slots) return error.Inkling2PageRange;
++        const t0 = if (p.trace) clockNs() else 0;
++        defer if (p.trace) p.note(.ensure, t0);
++        const first = start / p.g.rowsPerPage();
++        const last = p.g.pagesFor(end);
++        var due: [batch]usize = undefined;
++        var n_due: usize = 0;
++        var drained = false;
++        for (0..p.g.slotPlanes()) |j| {
++            const pl = p.g.slotPlane(slot, j);
++            for (first..last) |n| {
++                const i = p.g.pageIndex(pl, n);
++                if (p.mapped[i]) |page| if (page.refs.load(.acquire) == 1) continue;
++                if (!drained) {
++                    try s.synchronize(); // nothing may still read a page being replaced
++                    drained = true;
++                }
++                due[n_due] = i;
++                n_due += 1;
++                if (n_due == batch) {
++                    try p.privatize(s, due[0..n_due]);
++                    n_due = 0;
++                }
++            }
++        }
++        if (n_due > 0) try p.privatize(s, due[0..n_due]);
++    }
++
++    /// Give back the pages `slot` holds (its snapshots keep theirs) past its first `keep` a plane; within those, a page
++    /// a snapshot shares is swapped for one of the slot's own, so the next prompt writes its first rows without
++    /// mapping anything (`keep` 0: everything back, as before a restore). The stream is synchronized first.
++    pub fn releaseSlot(p: *Pages, s: cuda.Stream, slot: usize, keep: usize) !void {
++        const t0 = if (p.trace) clockNs() else 0;
++        var drained = false;
++        for (0..p.g.slotPlanes()) |j| {
++            const pl = p.g.slotPlane(slot, j);
++            for (0..p.g.pagesPerPlane()) |n| {
++                const i = p.g.pageIndex(pl, n);
++                const page = p.mapped[i] orelse continue;
++                if (n < keep and page.refs.load(.acquire) == 1) continue; // the slot's own: kept for its next prompt
++                if (!drained) {
++                    try s.synchronize();
++                    drained = true;
++                }
++                try p.vmm.unmapPhysical(p.d, p.address(i), p.g.page_bytes);
++                p.mapped[i] = null;
++                page.release(p);
++                p.stats.released += 1;
++                if (n < keep) {
++                    // a kept page only spares the next prompt a map: without one, the zero page (never an unmapped address)
++                    const fresh = p.newPage() catch {
++                        try p.mapZero(i);
++                        continue;
++                    };
++                    p.vmm.mapPhysical(p.d, p.address(i), p.g.page_bytes, fresh.handle) catch |e| {
++                        fresh.release(p);
++                        try p.mapZero(i);
++                        return e;
++                    };
++                    p.mapped[i] = fresh;
++                    p.stats.fresh += 1;
++                } else try p.mapZero(i);
++            }
++        }
++        if (p.trace) p.note(.release, t0);
++    }
++
++    pub const Stat = enum { ensure, release, restore };
++
++    fn clockNs() u64 {
++        var t: std.c.timespec = undefined;
++        _ = std.c.clock_gettime(.MONOTONIC, &t);
++        return @as(u64, @intCast(t.sec)) * 1_000_000_000 + @as(u64, @intCast(t.nsec));
++    }
++
++    /// TF_INKLING2_PAGES_TRACE=1: wall time and page work by kind, logged every 64 releases.
++    fn note(p: *Pages, kind: Stat, t0: u64) void {
++        const k = @intFromEnum(kind);
++        p.stats.ns[k] += clockNs() - t0;
++        p.stats.calls[k] += 1;
++        if (kind == .release and p.stats.calls[k] % 64 == 0) std.log.info("Inkling KV pages: ensure {d} calls {d:.1} ms, release {d} calls {d:.1} ms, restore {d} calls {d:.1} ms; pages made {d}, copied {d}, released {d}", .{
++            p.stats.calls[0], @as(f64, @floatFromInt(p.stats.ns[0])) / 1e6, p.stats.calls[1], @as(f64, @floatFromInt(p.stats.ns[1])) / 1e6, p.stats.calls[2], @as(f64, @floatFromInt(p.stats.ns[2])) / 1e6, p.stats.fresh, p.stats.copies, p.stats.released,
++        });
++    }
++
++    /// Pages a plane a snapshot at `at` positions holds: the whole ones below it, and the partly filled last one too
++    /// under share_partial.
++    pub fn snapPages(p: *const Pages, at: usize) usize {
++        return if (p.share_partial) p.g.pagesFor(at) else at / p.g.rowsPerPage();
++    }
++
++    /// `slot`'s whole pages below `at` positions, by reference (none for a prompt shorter than a page).
++    pub fn snapshot(p: *Pages, slot: usize, at: usize) !Snapshot {
++        const count = p.snapPages(at);
++        if (count > p.g.pagesPerPlane() or slot >= p.g.slots) return error.Inkling2PageRange;
++        const saved = try p.a.alloc(*Page, p.g.slotPlanes() * count);
++        var held: usize = 0;
++        errdefer {
++            for (saved[0..held]) |page| page.release(p);
++            p.a.free(saved);
++        }
++        for (0..p.g.slotPlanes()) |j| {
++            const pl = p.g.slotPlane(slot, j);
++            for (0..count) |n| {
++                const page = p.mapped[p.g.pageIndex(pl, n)] orelse return error.Inkling2MissingPage;
++                page.retain();
++                saved[held] = page;
++                held += 1;
++            }
++        }
++        // charge each page to the first snapshot that holds it
++        p.lockPool();
++        defer p.unlockPool();
++        const id = p.next_snapshot;
++        p.next_snapshot += 1;
++        var charged: usize = 0;
++        for (saved) |page| {
++            if (page.snaps == 0) {
++                page.owner = id;
++                charged += p.g.page_bytes;
++            }
++            page.snaps += 1;
++        }
++        return .{ .from = p, .at = at, .pages = saved, .id = id, .charged = charged };
++    }
++
++    /// Make `slot` hold `saved`'s whole pages (shared) and, past them, only the pages it keeps of its own (the caller
++    /// copies the partly filled last page's rows into those).
++    pub fn restore(p: *Pages, s: cuda.Stream, slot: usize, saved: *const Snapshot) !void {
++        if (saved.from != p) return error.Inkling2PageRange;
++        const count = p.snapPages(saved.at);
++        if (saved.pages.len != count * p.g.slotPlanes()) return error.Inkling2PageRange;
++        const t0 = if (p.trace) clockNs() else 0;
++        defer if (p.trace) p.note(.restore, t0);
++        try p.releaseSlot(s, slot, p.keep);
++        try s.synchronize();
++        for (0..p.g.slotPlanes()) |j| {
++            const pl = p.g.slotPlane(slot, j);
++            for (0..count) |n| {
++                const i = p.g.pageIndex(pl, n);
++                const page = saved.pages[j * count + n];
++                if (p.mapped[i] == page) continue; // already this snapshot's page
++                // unmapped before a page of the slot's own goes back: a pooled handle is never still mapped here
++                try p.vmm.unmapPhysical(p.d, p.address(i), p.g.page_bytes);
++                if (p.mapped[i]) |own| { // a kept page of the slot's own goes back for the shared one
++                    p.mapped[i] = null;
++                    own.release(p);
++                    p.stats.released += 1;
++                }
++                p.vmm.mapPhysical(p.d, p.address(i), p.g.page_bytes, page.handle) catch |e| {
++                    p.mapZero(i) catch {};
++                    return e;
++                };
++                page.retain();
++                p.mapped[i] = page;
++            }
++        }
++    }
++};
++
++test "Mini's whole caches: 8 visits a slot take 32 KiB a position, in whole 2 MiB pages a plane" {
++    const g: Geometry = .{ .visits = 8, .slots = 8, .heads = 8, .ring = alignContext(262144 + 1032), .page_bytes = 2 << 20 };
++    const t = std.testing;
++    try t.expectEqual(@as(usize, 278528), g.ring);
++    try t.expectEqual(@as(usize, 34), g.pagesPerPlane());
++    try t.expectEqual(@as(usize, 128), g.slotPlanes());
++    try t.expectEqual(@as(usize, 8192), g.rowsPerPage());
++    try t.expectEqual(@as(usize, 256 << 20), g.bytesAt(1));
++    try t.expectEqual(@as(usize, 8 << 30), g.bytesAt(262144));
++    // the model's order: visit, side, slot, head
++    try t.expectEqual(@as(usize, ((3 * 2 + 1) * 8 + 5) * 8 + 2), g.plane(3, 1, 5, 2));
++    try t.expectEqual(g.plane(3, 1, 5, 2), g.slotPlane(5, (3 * 2 + 1) * 8 + 2));
++}
++
++/// A VMM and driver in host memory for the pages' error paths: which handle each address maps, which handles live,
++/// and failures on demand (CUDA_ERROR_NOT_READY: Driver.check returns it without logging).
++const FakeVmm = struct {
++    const va0: u64 = 1 << 40;
++    const page: u64 = 2 << 20;
++    var maps: [160]u64 = undefined; // per page index (copy addresses past the slots'): the mapped handle (0: unmapped)
++    var live: [256]bool = undefined; // handle -> created and not released
++    var tags: [256]u32 = undefined; // handle -> what its rows hold (a copy carries the source's)
++    var copies: usize = 0;
++    var next: u64 = 1;
++    var fail_create: bool = false;
++    var fail_unmap: bool = false;
++
++    fn reset() void {
++        @memset(&maps, 0);
++        @memset(&live, false);
++        @memset(&tags, 0);
++        copies = 0;
++        next = 1;
++        fail_create = false;
++        fail_unmap = false;
++    }
++    fn index(addr: u64) usize {
++        return @intCast((addr - va0) / page);
++    }
++    fn create(h: *u64, _: usize, _: *const cuda.arena.Vmm.Prop, _: c_ulonglong) callconv(.c) cuda.abi.Result {
++        if (fail_create) return cuda.abi.error_not_ready;
++        h.* = next;
++        live[next] = true;
++        next += 1;
++        return cuda.abi.success;
++    }
++    fn release(h: u64) callconv(.c) cuda.abi.Result {
++        live[h] = false;
++        return cuda.abi.success;
++    }
++    fn map(addr: u64, _: usize, _: usize, h: u64, _: c_ulonglong) callconv(.c) cuda.abi.Result {
++        if (maps[index(addr)] != 0 or !live[h]) return 1;
++        maps[index(addr)] = h;
++        return cuda.abi.success;
++    }
++    fn unmap(addr: u64, _: usize) callconv(.c) cuda.abi.Result {
++        if (fail_unmap) return cuda.abi.error_not_ready;
++        if (maps[index(addr)] == 0) return 1;
++        maps[index(addr)] = 0;
++        return cuda.abi.success;
++    }
++    fn access(_: u64, _: usize, _: *const anyopaque, _: usize) callconv(.c) cuda.abi.Result {
++        return cuda.abi.success;
++    }
++    fn sync(_: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
++        return cuda.abi.success;
++    }
++    fn copy(dst: u64, src: u64, _: usize, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
++        const d = maps[index(dst)];
++        const s = maps[index(src)];
++        if (d == 0 or s == 0) return 1;
++        tags[d] = tags[s];
++        copies += 1;
++        return cuda.abi.success;
++    }
++
++    /// Pages over the fake: 1 visit, 2 slots, 1 key head, 2 pages a plane (4 planes, 8 page addresses).
++    fn open(a: A, d: *cuda.Driver) !*Pages {
++        reset();
++        d.api.cuStreamSynchronize = sync;
++        d.api.cuMemcpyDtoDAsync_v2 = @ptrCast(&copy);
++        var v: cuda.arena.Vmm = undefined;
++        v.api.create = create;
++        v.api.release = release;
++        v.api.map = map;
++        v.api.unmap = unmap;
++        v.api.setAccess = @ptrCast(&access);
++        v.device = 0;
++        v.prop = .{};
++        v.granularity = page;
++        v.va = va0;
++        v.va_len = maps.len * page;
++        const g: Geometry = .{ .visits = 1, .slots = 2, .heads = 1, .ring = 2 * page / row_bytes, .page_bytes = page };
++        const p = try a.create(Pages);
++        const mapped = try a.alloc(?*Page, g.planes() * g.pagesPerPlane());
++        @memset(mapped, null);
++        p.* = .{ .a = a, .d = d, .vmm = v, .g = g, .mapped = mapped, .zero = 0, .read_only = true };
++        p.zero = try p.vmm.allocPhysical(d, page);
++        for (0..mapped.len) |i| try p.mapZero(i);
++        return p;
++    }
++
++    /// Every page address maps what `mapped` says (the zero page for null), and no pooled handle is mapped anywhere.
++    fn consistent(p: *const Pages) !void {
++        for (p.mapped, 0..) |m, i| try std.testing.expectEqual(if (m) |pg| pg.handle else p.zero, maps[i]);
++        for (p.pool[0..p.pooled]) |h| for (maps) |m| try std.testing.expect(m != h);
++    }
++
++    fn close(p: *Pages) void {
++        for (p.mapped) |m| if (m) |pg| pg.release(p);
++        p.a.free(p.mapped);
++        p.a.destroy(p);
++    }
++};
++
++test "shared KV pages: a failed kept-page allocation at release leaves the zero page mapped, not a hole" {
++    const a = std.testing.allocator;
++    var d: cuda.Driver = undefined;
++    const p = try FakeVmm.open(a, &d);
++    defer FakeVmm.close(p);
++    const s: cuda.Stream = .{ .d = &d, .handle = null };
++    try p.ensure(s, 0, 0, 2 * p.g.rowsPerPage()); // slot 0: both pages of both planes its own
++    const snap = try p.snapshot(0, p.g.rowsPerPage()); // a prompt state holds the first page of each plane
++    defer snap.deinit();
++    FakeVmm.fail_create = true; // out of pages: the shared kept page cannot be swapped for a fresh one
++    try p.releaseSlot(s, 0, 1);
++    FakeVmm.fail_create = false;
++    try FakeVmm.consistent(p);
++    // the slot writes again from position 0: the zero page under it turns private as usual
++    try p.ensure(s, 0, 0, 1);
++    try FakeVmm.consistent(p);
++}
++
++test "shared KV pages: a failed unmap at restore keeps the slot's own page mapped and out of the pool" {
++    const a = std.testing.allocator;
++    var d: cuda.Driver = undefined;
++    const p = try FakeVmm.open(a, &d);
++    defer FakeVmm.close(p);
++    const s: cuda.Stream = .{ .d = &d, .handle = null };
++    try p.ensure(s, 0, 0, p.g.rowsPerPage());
++    const snap = try p.snapshot(0, p.g.rowsPerPage());
++    defer snap.deinit();
++    try p.ensure(s, 1, 0, p.g.rowsPerPage()); // slot 1 keeps a first page of its own a plane
++    const pooled = p.pooled;
++    FakeVmm.fail_unmap = true;
++    try std.testing.expectError(error.NotReady, p.restore(s, 1, &snap));
++    FakeVmm.fail_unmap = false;
++    try std.testing.expectEqual(pooled, p.pooled); // nothing recycled while still mapped
++    try FakeVmm.consistent(p);
++    try p.restore(s, 1, &snap); // the driver recovers: the snapshot's pages are mapped, the own ones pooled
++    try FakeVmm.consistent(p);
++    for (0..p.g.slotPlanes()) |j| try std.testing.expectEqual(snap.pages[j], p.mapped[p.g.pageIndex(p.g.slotPlane(1, j), 0)].?);
++}
++
++test "shared KV pages: copy on write gives the writer a copy and leaves the snapshot its page" {
++    const a = std.testing.allocator;
++    var d: cuda.Driver = undefined;
++    const p = try FakeVmm.open(a, &d);
++    defer FakeVmm.close(p);
++    p.share_partial = true; // TF_INKLING2_SNAP_SHARE_PARTIAL: the partly filled first page is shared, not copied
++    const s: cuda.Stream = .{ .d = &d, .handle = null };
++    try p.ensure(s, 0, 0, 100);
++    for (0..p.g.slotPlanes()) |j| FakeVmm.tags[p.mapped[p.g.pageIndex(p.g.slotPlane(0, j), 0)].?.handle] = @intCast(10 + j);
++    const snap = try p.snapshot(0, 100);
++    defer snap.deinit();
++    try std.testing.expectEqual(@as(usize, 1), p.snapPages(100));
++    try std.testing.expectEqual(@as(usize, 0), FakeVmm.copies);
++    // the stream writes on at 100, inside the shared page: it is copied for the slot first
++    try p.ensure(s, 0, 100, 101);
++    try std.testing.expectEqual(p.g.slotPlanes(), FakeVmm.copies);
++    try FakeVmm.consistent(p);
++    for (0..p.g.slotPlanes()) |j| {
++        const mine = p.mapped[p.g.pageIndex(p.g.slotPlane(0, j), 0)].?;
++        try std.testing.expect(mine != snap.pages[j]);
++        try std.testing.expectEqual(@as(u32, @intCast(10 + j)), FakeVmm.tags[mine.handle]); // the rows came along
++        try std.testing.expectEqual(@as(usize, 1), mine.refs.load(.acquire));
++        try std.testing.expect(FakeVmm.live[snap.pages[j].handle]); // the snapshot's page lives on
++    }
++    // a restore into slot 1 shares the page again, and its first write copies it again
++    try p.restore(s, 1, &snap);
++    try FakeVmm.consistent(p);
++    try p.ensure(s, 1, 100, 108);
++    try std.testing.expectEqual(2 * p.g.slotPlanes(), FakeVmm.copies);
++    try FakeVmm.consistent(p);
++    // the slot gives its pages back (none kept): the pool takes them, nothing it holds is still mapped
++    try p.releaseSlot(s, 0, 0);
++    try p.releaseSlot(s, 1, 0);
++    try FakeVmm.consistent(p);
++    try std.testing.expect(p.pooled >= 2 * p.g.slotPlanes());
++}
+diff --git a/zig/src/families/inkling2/mini_snap.zig b/zig/src/families/inkling2/mini_snap.zig
+index 4f48ba5..32b8034 100644
+--- a/zig/src/families/inkling2/mini_snap.zig
++++ b/zig/src/families/inkling2/mini_snap.zig
+@@ -10,8 +10,11 @@ pub const Saved = struct {
+     at: u32,
+     visits: u32, // the plan's visit count it was made under (a state never crosses plans)
+     buf: cuda.DeviceBuffer,
++    pages: ?mini_pages.Snapshot = null, // shared KV: the whole caches' pages through `at`, held by reference
+ };
+ 
++const mini_pages = @import("mini_pages.zig");
++
+ /// Positions a sliding ring keeps at `at`: a later row reads keys from its position - window + 1 on.
+ pub fn tail(window: usize, at: usize) usize {
+     return @min(at, window - 1);
+@@ -35,7 +38,8 @@ pub fn each(m: *const mm.Model, slot: usize, at: usize, ctx: anytype, comptime f
+     for (m.w.plan.visits.slice(), 0..) |step, v| {
+         const full = step.of(.full) != null;
+         const len: usize = if (full) m.full.ring else m.sliding.ring;
+-        const from = if (full) 0 else at - tail(m.c.window, at);
++        // shared KV: a whole cache's whole pages stay shared (Saved.pages); only its partly filled last page's rows copy
++        const from = if (!full) at - tail(m.c.window, at) else if (m.shared_kv) m.pageStart(at) else 0;
+         for (0..2) |side| for (0..kvh) |h| {
+             const base = m.kv[side][v] + ((slot * kvh + h) * len) * rb;
+             var p = from;
+@@ -67,11 +71,11 @@ const Count = struct {
+     }
+ };
+ 
+-/// Bytes a state at `at` takes.
++/// Bytes a state at `at` takes (shared KV: its pages too, which it alone holds once its stream moves on).
+ pub fn bytes(m: *const mm.Model, at: usize) u64 {
+     var n: usize = 0;
+     each(m, 0, at, Count{ .n = &n }, Count.add) catch unreachable;
+-    return n;
++    return n + m.pageBytes(at);
+ }
+ 
+ const Copy = struct {
+@@ -86,14 +90,28 @@ const Copy = struct {
+     }
+ };
+ 
++/// The storage a kept state holds: its copies, and (shared KV) the pages it alone was charged for.
++pub fn charged(k: *const Saved) u64 {
++    return k.buf.len + if (k.pages) |sp| sp.charged else 0;
++}
++
++/// Bytes of pages kept states hold whose charged state is gone (the prompt cache's spare storage).
++pub fn spare(m: *const mm.Model) u64 {
++    const p = m.pages orelse return 0;
++    p.lockPool();
++    defer p.unlockPool();
++    return p.orphan_bytes;
++}
++
+ /// Copy `slot`'s state at `at` into new storage, queued on `s` behind the chunk that ends there.
+ pub fn save(gpa: std.mem.Allocator, m: *const mm.Model, s: cuda.Stream, slot: usize, at: u32) !*Saved {
+     if (at == 0 or at > m.context) return error.NotAtMark;
+     const k = try gpa.create(Saved);
+     errdefer gpa.destroy(k);
+-    k.* = .{ .at = at, .visits = @intCast(m.w.plan.visits.len), .buf = try cuda.DeviceBuffer.alloc(m.d, @max(bytes(m, at), 256)) };
++    k.* = .{ .at = at, .visits = @intCast(m.w.plan.visits.len), .buf = try cuda.DeviceBuffer.alloc(m.d, @max(bytes(m, at) - m.pageBytes(at), 256)) };
+     errdefer k.buf.free();
+     try each(m, slot, at, Copy{ .m = m, .s = s, .buf = k.buf.ptr, .out = true }, Copy.copy);
++    if (m.pages) |p| k.pages = try p.snapshot(slot, at);
+     return k;
+ }
+ 
+@@ -101,12 +119,19 @@ pub fn save(gpa: std.mem.Allocator, m: *const mm.Model, s: cuda.Stream, slot: us
+ pub fn restore(m: *const mm.Model, s: cuda.Stream, slot: usize, k: *const Saved) !void {
+     if (k.visits != m.w.plan.visits.len) return error.Inkling2StateOfAnotherPlan;
+     if (k.at > m.context) return error.PastContext;
++    if (m.pages) |p| {
++        const pages = if (k.pages) |*sp| sp else return error.Inkling2StateOfAnotherPlan;
++        try p.restore(s, slot, pages);
++        // the partly filled last page: rows of the slot's own, written by the copies below
++        if (m.pageStart(k.at) < k.at) try p.ensure(s, slot, m.pageStart(k.at), k.at);
++    } else if (k.pages != null) return error.Inkling2StateOfAnotherPlan;
+     try each(m, slot, k.at, Copy{ .m = m, .s = s, .buf = k.buf.ptr, .out = false }, Copy.copy);
+ }
+ 
+ /// Free a state once the stream's queued copies of it are done.
+ pub fn drop(gpa: std.mem.Allocator, s: cuda.Stream, k: *Saved) void {
+     s.synchronize() catch {};
++    if (k.pages) |sp| sp.deinit();
+     k.buf.free();
+     gpa.destroy(k);
+ }
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index 9fbf97a..aa39c0c 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -382,8 +382,16 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, asked: a
+     errdefer gpa.destroy(h);
+     h.* = .{ .gpa = gpa, .gpu = g, .family = loaded.ctx, .release = loaded.deinit, .inner = served.backend, .served = served, .vtable = undefined, .cfg = undefined, .clock = undefined, .core = undefined, .host = undefined, .lone = if (@hasField(L, "lone")) loaded.lone else null };
+     h.readiness(F);
+-    h.kv_plan = counted.ledger; // a ledger's plan placed the cache already, beside --parallel full-window requests
+-    const kept = if (host_cache) kv_pages.kept(F, loaded, paged, o, room, held, final_host_budget, true) else if (counted.ledger) |lp| lp.kept else kv_pages.kept(F, loaded, paged, o, room, held, 0, false);
++    h.kv_plan = counted.ledger;
++    // a ledger's plan placed the cache already, beside --parallel full-window requests
++    const kept = if (counted.ledger != null and counted.ledger.?.reserved_pages)
++        counted.ledger.?.kept
++    else if (host_cache)
++        kv_pages.kept(F, loaded, paged, o, room, held, final_host_budget, true)
++    else if (counted.ledger) |lp|
++        lp.kept
++    else
++        kv_pages.kept(F, loaded, paged, o, room, held, 0, false);
+     if (h.kv_plan) |*lp| lp.kept = kept;
+     const cache = kept.copied;
+     const cache_capacity = kv_pages.capacity(F, loaded, kept, @intCast(window));
+@@ -548,6 +556,7 @@ test {
+     _ = @import("cuda_ceiling_test.zig");
+     _ = @import("cuda_vision_offer.zig");
+     _ = @import("cuda_ledger.zig");
++    _ = @import("cuda_streams.zig");
+     _ = kv_pages;
+     _ = drafted;
+     _ = cuda_disk; // its tests run under test-cuda-disk-open-host's filter
+diff --git a/zig/src/native/cuda_ledger.zig b/zig/src/native/cuda_ledger.zig
+index b19eae6..7f3b77c 100644
+--- a/zig/src/native/cuda_ledger.zig
++++ b/zig/src/native/cuda_ledger.zig
+@@ -13,8 +13,11 @@ pub const Cost = struct {
+     context: u64, // the request bound the server enforces (prompt + reply)
+ 
+     pub fn of(c: *const Cost, prompt: u32, max_tokens: u32) u64 {
+-        const rows = @min(@as(u64, prompt) + max_tokens, c.context) + c.each.lookahead;
+-        return c.each.layout.fixed_bytes +| c.each.layout.token_bytes *| rows;
++        const layout = c.each.layout;
++        const raw = @min(@as(u64, prompt) + max_tokens, c.context) + c.each.lookahead;
++        // pages too: a verify window at the window's end writes its lookahead rows, past the context, into a page
++        const rows = if (layout.page_tokens == 0) raw else std.mem.alignForward(u64, raw, layout.page_tokens);
++        return layout.fixed_bytes +| layout.token_bytes *| rows;
+     }
+ 
+     fn call(ctx: *anyopaque, prompt: u32, max_tokens: u32) u64 {
+@@ -24,10 +27,11 @@ pub const Cost = struct {
+ };
+ 
+ /// The ledger's total (its standing streams in it), the cache beside it, a full-window request's cost, any one's.
+-pub const Plan = struct { total: u64, kept: kv_pages.Kept, one_full: u64, cost: Cost, standing: Standing = .{} };
++pub const Plan = struct { total: u64, kept: kv_pages.Kept, one_full: u64, cost: Cost, standing: Standing = .{}, reserved_pages: bool = false };
+ 
+-/// What the budget needs from load beyond the family.
+-pub const Inputs = struct { room: u64, context: i64, host_budget: u64, host_cache: bool };
++/// What the budget needs from load beyond the family. `stream_extra`: bytes a stream takes that are allocated after the
++/// plan (a drafter's per-stream caches, `Served.reserve`), so the room read at load does not hold them yet.
++pub const Inputs = struct { room: u64, context: i64, host_budget: u64, host_cache: bool, stream_extra: u64 = 0 };
+ 
+ /// Why no request fits: a full-window request's cost and the scratch it sits beside.
+ pub const Short = struct { one_full: u64, scratch: u64 };
+@@ -72,6 +76,33 @@ pub fn plan(comptime F: type, loaded: anytype, o: api.Open, in: Inputs, short: *
+     return .{ .total = total, .kept = kept, .one_full = one_full, .cost = cost, .standing = standing };
+ }
+ 
++/// Windows share a budget when the family reserves lane scratch but maps global KV on demand.
++pub fn shared(comptime F: type, loaded: anytype, o: api.Open, in: Inputs, short: *?Short) ?Plan {
++    if (comptime !@hasField(@TypeOf(loaded), "shared_pages")) return null;
++    const pages = loaded.shared_pages orelse return null;
++    // the drafter's caches for every stream are allocated once the count is known: out of the room before the budget
++    const fixed = pages.fixed_bytes *| (o.lanes -| 1) +| pages.scratch +| in.stream_extra *| o.lanes;
++    const cost: Cost = .{
++        .context = @intCast(in.context),
++        .each = .{
++            .layout = .{ .fixed_bytes = 0, .token_bytes = pages.token_bytes, .page_tokens = pages.page_tokens, .snap_bytes = 0 },
++            .lookahead = pages.lookahead,
++            .scratch = fixed,
++        },
++    };
++    const one_full = cost.of(@intCast(in.context), 0);
++    const usable = in.room -| fixed;
++    if (one_full > usable) {
++        short.* = .{ .one_full = one_full, .scratch = fixed };
++        return null;
++    }
++    var kept = kv_pages.kept(F, loaded, null, o, usable, 0, in.host_budget, in.host_cache);
++    // Inkling's host-budgeted snapshots retain CUDA pages as well as copied CPU state. Reserve
++    // their entire charge separately. Both tiers share the same physical memory on GB10.
++    kept.copied = @min(kept.copied, usable - one_full);
++    return .{ .total = usable - kept.copied, .kept = kept, .one_full = one_full, .cost = cost, .reserved_pages = true };
++}
++
+ /// The lane host's hook over a plan that outlives the host (the CUDA Host keeps it).
+ pub fn info(p: ?*const Plan) ?api.Ledger {
+     const x = p orelse return null;
+@@ -103,6 +134,65 @@ test "kv ledger cost: prompt and reply rows within the context, plus the lookahe
+     try std.testing.expectEqual(c.of(4096, 0), c.of(1, 4095)); // every full-window request costs the same
+ }
+ 
++test "shared KV ledger charges physical page groups and budgets retained snapshots separately" {
++    const kib: u64 = 1 << 10;
++    const pages = .{
++        .fixed_bytes = 2 * kib,
++        .scratch = kib,
++        .token_bytes = 24,
++        .page_tokens = 256,
++        .lookahead = 7,
++    };
++    const loaded = .{ .shared_pages = @as(?@TypeOf(pages), pages) };
++    const o: api.Open = .{ .dir = "", .model_type = "inkling", .lanes = 8 };
++    const room = 72 * kib;
++    var short: ?Short = null;
++    const p = shared(Cached, loaded, o, .{ .room = room, .context = 1024, .host_budget = 6 * kib, .host_cache = true }, &short).?;
++    try std.testing.expectEqual(@as(u64, room - 15 * kib - 6 * kib), p.total);
++    try std.testing.expectEqual(@as(u64, 6 * kib), p.cost.of(246, 3));
++    try std.testing.expectEqual(@as(u64, 12 * kib), p.cost.of(246, 4));
++    // a full-window request: its 7 lookahead rows reach a fifth page, which the forward maps
++    try std.testing.expectEqual(@as(u64, 30 * kib), p.cost.of(1024, 0));
++    try std.testing.expect(p.total >= p.one_full and p.total < 2 * p.one_full);
++}
++
++test "shared KV cost: requests ending at the window's end lease the page their verify lookahead writes" {
++    // Mini at --context 262144: 8,192 positions a 2 MiB page, 128 planes (32 KiB a position), 8 verify rows
++    const page: u64 = 128 * (2 << 20);
++    const c: Cost = .{ .context = 262144, .each = .{ .layout = .{ .fixed_bytes = 0, .token_bytes = 32 << 10, .page_tokens = 8192, .snap_bytes = 0 }, .lookahead = 8, .scratch = 0 } };
++    // a verify at position 262,143 writes rows 262,143..262,150: pagesFor(262,151) = 33 pages a plane
++    try std.testing.expectEqual(33 * page, c.of(262144, 0));
++    try std.testing.expectEqual(33 * page, c.of(262000, 144));
++    try std.testing.expectEqual(33 * page, c.of(1, 1 << 30)); // past the context: capped there, lookahead kept
++    // ending 8 rows short of a page's end, the lookahead stays inside it
++    try std.testing.expectEqual(32 * page, c.of(262136, 0));
++    try std.testing.expectEqual(33 * page, c.of(262137, 0));
++    try std.testing.expectEqual(page, c.of(100, 8084));
++    try std.testing.expectEqual(2 * page, c.of(100, 8085));
++}
++
++test "shared KV ledger keeps a drafter's per-stream caches, allocated after the plan, out of the budget" {
++    const kib: u64 = 1 << 10;
++    const pages = .{ .fixed_bytes = 0, .scratch = kib, .token_bytes = 24, .page_tokens = 256, .lookahead = 7 };
++    const loaded = .{ .shared_pages = @as(?@TypeOf(pages), pages) };
++    const o: api.Open = .{ .dir = "", .model_type = "inkling", .lanes = 8 };
++    const room = 200 * kib;
++    const extra = 3 * kib; // a drafter's caches a stream
++    var short: ?Short = null;
++    const in: Inputs = .{ .room = room, .context = 1024, .host_budget = 6 * kib, .host_cache = true };
++    const bare = shared(Cached, loaded, o, in, &short).?;
++    var with = in;
++    with.stream_extra = extra;
++    const p = shared(Cached, loaded, o, with, &short).?;
++    try std.testing.expectEqual(bare.total - 8 * extra, p.total);
++    try std.testing.expectEqual(kib + 8 * extra, p.cost.each.scratch);
++    // everything the plan hands out, the scratch and the drafter's caches fit the room
++    try std.testing.expect(p.total + p.kept.copied + p.cost.each.scratch <= room);
++    // a drafter that leaves no full window is refused, not overcommitted
++    with.stream_extra = room / 8;
++    try std.testing.expectEqual(@as(?Plan, null), shared(Cached, loaded, o, with, &short));
++}
++
+ test "kv ledger plan: the prompt cache takes only what --parallel full-window requests leave" {
+     const o: api.Open = .{ .dir = "", .model_type = "f", .prompt_cache_gib = 1, .lanes = 4 };
+     var short: ?Short = null;
+diff --git a/zig/src/native/cuda_streams.zig b/zig/src/native/cuda_streams.zig
+index 303354e..ad1995e 100644
+--- a/zig/src/native/cuda_streams.zig
++++ b/zig/src/native/cuda_streams.zig
+@@ -58,6 +58,12 @@ pub fn shareSlots(share: bool, snap_bytes: u64, host_cache: bool) !?usize {
+     return if (share and snap_bytes > 0 and !host_cache) try @import("core").kv_prompts.sharing() else null;
+ }
+ 
++/// Shared KV: the streams served are the slots the family opened at load (`free_streams`, which --parallel auto or a
++/// round's cap may hold below --parallel); a stream past them would find no slot (error.NoFreeSlot).
++pub fn sharedLanes(lanes: u32, free: u32) u32 {
++    return if (free > 0) @min(lanes, free) else lanes;
++}
++
+ /// The family's streams in `b.room`; null with `problem` set when none fit or --parallel asks for more than fit.
+ pub fn count(comptime F: type, a: Allocator, loaded: anytype, o: api.Open, b: Budget, problem: *[]const u8) !?Count {
+     const free = loaded.free_streams;
+@@ -69,6 +75,19 @@ pub fn count(comptime F: type, a: Allocator, loaded: anytype, o: api.Open, b: Bu
+         const planned = kv_pages.budgetOf(F, l, wrapped.room, o, @intCast(b.window), b.host_cache, kv_pages.enginePaged(loaded), keptPpm(F, b.share), slots);
+         return .{ .streams = paged.lanes, .paged = paged, .layout = l, .slots = slots, .planned = if (slots != null) planned else null };
+     }
++    // Global KV maps pages on demand while the engine reserves each lane's fixed scratch at load.
++    if (comptime @hasField(@TypeOf(loaded), "shared_pages")) if (loaded.shared_pages != null) {
++        var short: ?ledger.Short = null;
++        var so = o;
++        so.lanes = sharedLanes(o.lanes, free);
++        // a drafter wrap's per-stream caches (b.stream_bytes past the family's) are allocated after this plan
++        const extra = b.stream_bytes -| loaded.stream_bytes;
++        const p = ledger.shared(F, loaded, so, .{ .room = b.room, .context = b.window, .host_budget = b.host_budget, .host_cache = b.host_cache, .stream_extra = extra }, &short) orelse {
++            problem.* = try std.fmt.allocPrint(a, no_stream, .{ b.window, toGib(short.?.one_full +| short.?.scratch), toGib(b.room), toGib(b.model), toGib(b.reserve), b.low });
++            return null;
++        };
++        return .{ .streams = so.lanes, .paged = null, .layout = null, .ledger = p };
++    };
+     // --parallel caps the streams; each request reserves its own bytes (a family that allocates per request)
+     if (ledger.wanted(F, loaded, b.stream_bytes)) {
+         var short: ?ledger.Short = null;
+@@ -151,6 +170,13 @@ test "TF_KV_SHARE unset or empty plans as before: no slot, and GLM's copies take
+     }
+ }
+ 
++test "shared KV serves no more streams than the slots the family opened" {
++    try std.testing.expectEqual(@as(u32, 4), sharedLanes(8, 4));
++    try std.testing.expectEqual(@as(u32, 8), sharedLanes(8, 8));
++    try std.testing.expectEqual(@as(u32, 8), sharedLanes(8, 64));
++    try std.testing.expectEqual(@as(u32, 8), sharedLanes(8, 0)); // a family that opens none at load
++}
++
+ test "CUDA cache default uses the declared request ledger windows and scratch" {
+     const GiB: u64 = 1 << 30;
+     var counted: Count = .{ .streams = 8, .paged = null, .layout = null };

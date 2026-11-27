@@ -1,0 +1,259 @@
+diff --git a/zig/src/core/lanes/host_logrow.zig b/zig/src/core/lanes/host_logrow.zig
+new file mode 100644
+index 0000000..af88184
+--- /dev/null
++++ b/zig/src/core/lanes/host_logrow.zig
+@@ -0,0 +1,126 @@
++//! Log probabilities from FP32 logits on the host.
++const std = @import("std");
++const top = @import("logprob.zig").max_top;
++const lane_width = 8;
++
++/// e^x for x <= 0 (under -80: 0), 1.5e-7 relative per unit of |x| at worst: 2^n by exponent bits, 2^f by Taylor.
++fn expLow(x: @Vector(lane_width, f32)) @Vector(lane_width, f32) {
++    const V = @Vector(lane_width, f32);
++    const U = @Vector(lane_width, u32);
++    const low: V = @splat(-80);
++    const t = @max(x, low) * @as(V, @splat(1.4426950408889634)); // x in log2 units
++    const n = @round(t);
++    const f = (t - n) * @as(V, @splat(0.6931471805599453)); // the remainder in natural units, |f| <= 0.347
++    var p: V = @splat(1.0 / 5040.0);
++    inline for (.{ 1.0 / 720.0, 1.0 / 120.0, 1.0 / 24.0, 1.0 / 6.0, 0.5, 1.0, 1.0 }) |c| p = p * f + @as(V, @splat(c));
++    const biased = @as(@Vector(lane_width, i32), @intFromFloat(n)) + @as(@Vector(lane_width, i32), @splat(127));
++    const bits: U = @bitCast(biased);
++    const scale: V = @bitCast(bits << @as(@Vector(lane_width, u5), @splat(23)));
++    return @select(f32, x < low, @as(V, @splat(0)), p * scale);
++}
++
++/// The best `top` logits so far, by logit descending, ties to the lower id (ids arrive in increasing order).
++const Best = struct {
++    raw: [top]f32 = undefined,
++    ids: [top]u32 = undefined,
++    filled: usize = 0,
++    bar: f32 = -std.math.inf(f32), // a logit must pass it to be taken: the worst held once `top` are held
++
++    fn add(b: *Best, id: usize, x: f32) void {
++        if (!(x > b.bar)) return;
++        var slot = @min(b.filled, top - 1);
++        while (slot > 0 and x > b.raw[slot - 1]) : (slot -= 1) {
++            b.raw[slot] = b.raw[slot - 1];
++            b.ids[slot] = b.ids[slot - 1];
++        }
++        b.raw[slot] = x;
++        b.ids[slot] = @intCast(id);
++        b.filled = @min(b.filled + 1, top);
++        if (b.filled == top) b.bar = b.raw[top - 1];
++    }
++};
++
++/// The row of `logits` for `pick`: f64 normalizer, best ids by logit, ties to the lower id; NaN or +inf: NaN logprob.
++pub fn row(logits: []const f32, pick: u32, count: u8) @import("logprob.zig").Row {
++    const V = @Vector(lane_width, f32);
++    var peak: V = @splat(-std.math.inf(f32));
++    var finite = true;
++    const inf: V = @splat(std.math.inf(f32));
++    var from: usize = 0;
++    while (from + lane_width <= logits.len) : (from += lane_width) {
++        const v: V = logits[from..][0..lane_width].*;
++        peak = @max(peak, v);
++        finite = finite and @reduce(.And, v < inf);
++    }
++    var most: f32 = @reduce(.Max, peak);
++    for (logits[from..]) |x| {
++        most = @max(most, x);
++        finite = finite and x < std.math.inf(f32);
++    }
++    const shift: V = @splat(most);
++    var sum: f64 = 0;
++    var block: V = @splat(0);
++    var best: Best = .{};
++    var at: usize = 0;
++    while (at + lane_width <= logits.len) : (at += lane_width) {
++        const v: V = logits[at..][0..lane_width].*;
++        block += expLow(v - shift);
++        if (at % 64 == 56) { // f32 sums of 64 terms, kept in f64
++            sum += @reduce(.Add, block);
++            block = @splat(0);
++        }
++        if (@reduce(.Or, v > @as(V, @splat(best.bar)))) for (logits[at..][0..lane_width], at..) |x, id| best.add(id, x);
++    }
++    sum += @reduce(.Add, block);
++    for (logits[at..], at..) |x, id| {
++        sum += @exp(x - most);
++        best.add(id, x);
++    }
++    const lse: f32 = most + @as(f32, @floatCast(@log(sum)));
++    const nan = std.math.nan(f32);
++    // only the alternatives found: a row with fewer usable logits than asked lists fewer (never unset entries)
++    var r: @import("logprob.zig").Row = .{ .token = pick, .logprob = if (finite) logits[pick] - lse else nan, .count = @intCast(@min(@min(count, top), best.filled)) };
++    r.ids = best.ids;
++    // NaN or +inf anywhere: the normalizer is meaningless, so every listed logprob is NaN too, as the token's is
++    for (best.raw[0..best.filled], 0..) |x, i| r.logprobs[i] = if (finite) x - lse else nan;
++    return r;
++}
++
++test "draft sources: XPU logprob row: the vector exponential stays near the library's" {
++    var x: [lane_width]f32 = undefined;
++    var k: f32 = 0;
++    while (k > -90) : (k -= 0.37) {
++        for (&x, 0..) |*v, i| v.* = k - @as(f32, @floatFromInt(i)) * 0.0113;
++        const got: [lane_width]f32 = expLow(x);
++        for (x, got) |a, g| {
++            const want: f64 = @exp(@as(f64, a));
++            if (a < -80) {
++                try std.testing.expectEqual(@as(f32, 0), g);
++            } else {
++                try std.testing.expectApproxEqRel(@as(f32, @floatCast(want)), g, 1.5e-7 * (1 - a));
++            }
++        }
++    }
++}
++
++test "logprob row: fewer usable logits than asked list only those; NaN or +inf makes every logprob NaN" {
++    const inf = std.math.inf(f32);
++    // two finite logits of 20 (16 vector lanes and a tail), five alternatives asked
++    var some: [20]f32 = @splat(-inf);
++    some[3] = 1.0;
++    some[17] = 2.0;
++    const r = row(&some, 17, 5);
++    try std.testing.expectEqual(@as(u8, 2), r.count);
++    try std.testing.expectEqual([2]u32{ 17, 3 }, r.ids[0..2].*);
++    try std.testing.expectApproxEqAbs(@as(f32, -0.31326), r.logprobs[0], 1e-4);
++    try std.testing.expectApproxEqAbs(r.logprob, r.logprobs[0], 1e-6);
++    // NaN inside the vector part and past it, and +inf: the token's and every listed logprob are NaN
++    for ([_]usize{ 5, 18 }) |at| for ([_]f32{ std.math.nan(f32), inf }) |bad| {
++        var xs: [20]f32 = undefined;
++        for (&xs, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i)) * 0.1;
++        xs[at] = bad;
++        const b = row(&xs, 0, 4);
++        try std.testing.expect(std.math.isNan(b.logprob));
++        for (b.logprobs[0..b.count]) |lp| try std.testing.expect(std.math.isNan(lp));
++    };
++}
+diff --git a/zig/src/core/lanes/lanes.zig b/zig/src/core/lanes/lanes.zig
+index 2672ab2..014b00d 100644
+--- a/zig/src/core/lanes/lanes.zig
++++ b/zig/src/core/lanes/lanes.zig
+@@ -44,6 +44,7 @@ pub const drafted = @import("drafted.zig");
+ pub const draft_tree = @import("draft_tree.zig");
+ pub const drafter_depth_sweep = @import("drafter_depth_sweep.zig"); // any family's Drafter at depths 1..block
+ pub const recorder = @import("recorder.zig");
++pub const host_logrow = @import("host_logrow.zig"); // OpenAI logprob rows from FP32 logits on the host
+ pub const logprob = @import("logprob.zig");
+ pub const grammar = @import("grammar.zig");
+ pub const grammar_time = @import("grammar_time.zig");
+diff --git a/zig/src/families/inkling2/mini_backend.zig b/zig/src/families/inkling2/mini_backend.zig
+index 2baf577..88d17b2 100644
+--- a/zig/src/families/inkling2/mini_backend.zig
++++ b/zig/src/families/inkling2/mini_backend.zig
+@@ -99,6 +99,7 @@ const Lane = struct {
+     chunk_at: u64 = 0, // the last prompt chunk's rows in m.taps, valid while m.gen == chunk_gen
+     chunk_rows: usize = 0,
+     chunk_gen: u64 = 0,
++    first_handle: ?u64 = null, // the first token's draw (its logprob row reads it against `last`)
+ };
+ 
+ /// The positions a slot holds for a served window, in whole 1,024s, with room for a full window's last verify.
+@@ -194,7 +195,7 @@ pub const Mini = struct {
+         return .{ .ptr = x, .vtable = &vtable };
+     }
+ 
+-    const vtable: be.Backend.VTable = .{ .prefill = prefill, .prefill_step = prefillStep, .first = first, .first_masked = firstMasked, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release, .reports_fill = true, .prepare_features = prepareFeatures, .features = features, .prefill_features = prefillFeatures };
++    const vtable: be.Backend.VTable = .{ .prefill = prefill, .prefill_step = prefillStep, .first = first, .first_masked = firstMasked, .first_row = firstRow, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release, .reports_fill = true, .prepare_features = prepareFeatures, .features = features, .prefill_features = prefillFeatures };
+ 
+     /// The round loop's facts: no draft head of its own; windows of up to verify_rows rows (a drafter's, or copies
+     /// with TF_INKLING2_COPY_DRAFTS=1), streams sharing a forward.
+@@ -472,9 +473,31 @@ pub const Mini = struct {
+         if (position != l.len or l.fill != null) return error.PositionMismatch;
+         const h = x.next;
+         try x.drawRows(l, l.last, 0, 1, position, x.handle(), 0, &.{}, 0);
++        l.first_handle = h;
+         return h;
+     }
+ 
++    /// The first token's logprob row: the prompt's last row of FP32 logits (`last`) read on the host.
++    fn firstRow(ptr: *anyopaque, s: *Stream) anyerror!lanes.LogprobRow {
++        const x = self(ptr);
++        const l = x.lanes.getPtr(s) orelse return error.UnknownStream;
++        const h = l.first_handle orelse return error.NoFirstRow;
++        const token = try read(x, h);
++        const rows = try x.hostRows(l.last, 1);
++        defer x.gpa.free(rows);
++        return lanes.host_logrow.row(rows, token, s.logprobs orelse 0);
++    }
++
++    /// `n` rows of FP32 logits from `src` on the host (gpa-owned), after the stream's queued work.
++    fn hostRows(x: *Mini, src: u64, n: usize) ![]f32 {
++        const v = x.vocab();
++        const out = try x.gpa.alloc(f32, n * v);
++        errdefer x.gpa.free(out);
++        try x.s.synchronize();
++        try cuda.memory.download(x.d, src, std.mem.sliceAsBytes(out));
++        return out;
++    }
++
+     /// The first token among the grammar's allowed ones (`mask`: one row of bits).
+     fn firstMasked(ptr: *anyopaque, s: *Stream, position: u64, mask: []const u32) anyerror!u64 {
+         const x = self(ptr);
+@@ -483,6 +506,7 @@ pub const Mini = struct {
+         _ = try x.maskWords(mask, 1);
+         const h = x.next;
+         try x.drawRows(l, l.last, 0, 1, position, x.handle(), 0, mask, 0);
++        l.first_handle = h;
+         return h;
+     }
+ 
+@@ -564,8 +588,12 @@ pub const Mini = struct {
+         if (wide) for (chains) |c| if (c.tokens.len > 1) try x.m.backupSlot(x.k, x.s, c.slot);
+         x.m.hist_on = wide;
+         defer x.m.hist_on = false;
+-        // a grammar's rows need every logit: its mask may refuse every candidate the lazy head keeps
+-        x.m.lazy_ok = !masked and total <= ops.Lazy.max_rows and for (windows) |w| {
++        // a grammar's rows need every logit: its mask may refuse every candidate the lazy head keeps; logprob rows
++        // read every logit too
++        const logrows = for (windows) |w| {
++            if (w.stream.logprobs != null) break true;
++        } else false;
++        x.m.lazy_ok = !masked and !logrows and total <= ops.Lazy.max_rows and for (windows) |w| {
+             const l = x.lanes.getPtr(w.stream).?;
+             var ok = true;
+             for (0..l.rows.items.len) |r| ok = ok and lazyRow(x, l, w.positions[0] + r, l.row0 + r);
+@@ -595,6 +623,12 @@ pub const Mini = struct {
+             const n = l.rows.items.len;
+             @memcpy(o.sampled[0..n], got[at..][0..n]);
+             @memcpy(o.drafts[0 .. n - 1], l.rows.items[1..]);
++            if (w.stream.logprobs) |k| if (o.rows.len >= n) {
++                // each row's raw target logprobs for its drawn token, from the forward's FP32 logits
++                const host = try x.hostRows(x.m.s.logits + at * x.vocab() * 4, n);
++                defer x.gpa.free(host);
++                for (o.rows[0..n], 0..) |*r, i| r.* = lanes.host_logrow.row(host[i * x.vocab() ..][0..x.vocab()], got[at + i], k);
++            };
+             l.len = l.base + n;
+             at += n;
+         }
+diff --git a/zig/src/families/inkling2/mini_native.zig b/zig/src/families/inkling2/mini_native.zig
+index 4dff1ad..11038a3 100644
+--- a/zig/src/families/inkling2/mini_native.zig
++++ b/zig/src/families/inkling2/mini_native.zig
+@@ -20,6 +20,8 @@ pub const max_segments: u32 = 1;
+ pub const prompt_rows: u32 = be.prompt_rows;
+ /// --drafter: the checkpoint folder (its mtp.safetensors) or the .safetensors file itself.
+ pub const takes_drafter = true;
++/// The DSpark wrapper passes the target's first-token logprob rows through (OpenAI logprobs with --drafter).
++pub const drafted_first_rows = true;
+ pub const explains_open = true;
+ /// A kept state is the caches and conv states through its position, nothing past it (no draft head reads on).
+ pub const snap_lookahead: u32 = 0;
+diff --git a/zig/src/native/cuda_drafted.zig b/zig/src/native/cuda_drafted.zig
+index d6ea4e1..458a1c3 100644
+--- a/zig/src/native/cuda_drafted.zig
++++ b/zig/src/native/cuda_drafted.zig
+@@ -76,6 +76,8 @@ pub fn wrap(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, loaded:
+         return null;
+     };
+     s.source = .{ .kind = opened.drafter.kind, .name = o.drafter_name orelse dir };
++    // a family that opts in passes its target's first-token logprob rows through the wrapper (logprobs offered)
++    if (comptime @hasDecl(F, "drafted_first_rows")) h.drafted.first_rows = F.drafted_first_rows and loaded.backend.vtable.first_row != null;
+     s.backend = h.drafted.backend();
+     s.facts = h.drafted.facts(loaded.facts);
+     s.stream_bytes = h.drafted.streamBytes(loaded.stream_bytes);

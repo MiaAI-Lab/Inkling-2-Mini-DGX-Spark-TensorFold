@@ -1,0 +1,241 @@
+diff --git a/zig/kernels/cuda/inkling2/mtp.cu b/zig/kernels/cuda/inkling2/mtp.cu
+index efd93c9..8a954c1 100644
+--- a/zig/kernels/cuda/inkling2/mtp.cu
++++ b/zig/kernels/cuda/inkling2/mtp.cu
+@@ -207,9 +207,10 @@ struct AttnArgs {
+     float* pml;  // fp32 [chunks][T * hq][2]: max, total
+     int T, hq, hk, ring, lo, hi, c0;
+     float scale;
++    int ck;  // keys a block takes: chunk c is keys [c * ck, (c + 1) * ck); a multiple of kKT
+ };
+ 
+-// A block's rows against keys [lo, hi], unmasked (the block sees itself whole); a 1,024-key chunk and a key head a
++// A block's rows against keys [lo, hi], unmasked (the block sees itself whole); an a.ck-key chunk and a key head a
+ // block (Inkling 2 Small's tf_ink2_dsp_attn, #4128, at Mini's 24 query rows a key head).
+ extern "C" __global__ void __launch_bounds__(256) tf_ink2m_attn(AttnArgs a) {
+     using namespace ink2m;
+@@ -220,7 +221,7 @@ extern "C" __global__ void __launch_bounds__(256) tf_ink2m_attn(AttnArgs a) {
+     __shared__ float sm[kMaxQ], sl[kMaxQ], sa[kMaxQ];
+     const int j = blockIdx.y, c = a.c0 + blockIdx.x, tid = threadIdx.x;
+     const int g = a.hq / a.hk, nq = a.T * g, nqt = a.T * a.hq;
+-    const int k0 = max(a.lo, c * kChunk), k1 = min(a.hi + 1, (c + 1) * kChunk);
++    const int k0 = max(a.lo, c * a.ck), k1 = min(a.hi + 1, (c + 1) * a.ck);
+     for (int idx = tid; idx < nq * kD; idx += blockDim.x) {
+         const int qi = idx / kD, d = idx % kD;
+         sq[qi][d] = bf(a.q[(static_cast<size_t>(qi / g) * a.hq + j * g + qi % g) * kD + d]);
+@@ -293,6 +294,76 @@ extern "C" __global__ void __launch_bounds__(256) tf_ink2m_attn(AttnArgs a) {
+     }
+ }
+ 
++// tf_ink2m_attn's partials, a warp per query row: lanes over the 128 dims (four each), a 64-key K/V tile in shared
++// memory, the scores by warp_sum and the softmax online in registers. The same partials (unnormalised sums, max,
++// total) for tf_ink2m_merge; the arithmetic order differs from tf_ink2m_attn, so proposals may differ in the last
++// bits (the target verifies them). Eight warps take the 24 query rows of a key head three rows each.
++extern "C" __global__ void __launch_bounds__(256) tf_ink2m_attn_w(AttnArgs a) {
++    using namespace ink2m;
++    constexpr int kT = 64;
++    __shared__ __align__(16) uint16_t sk[kT][kD];
++    __shared__ __align__(16) uint16_t sv[kT][kD];
++    const int j = blockIdx.y, c = a.c0 + blockIdx.x, tid = threadIdx.x, w = tid >> 5, lane = tid & 31;
++    const int g = a.hq / a.hk, nq = a.T * g, nqt = a.T * a.hq;
++    const int k0 = max(a.lo, c * a.ck), k1 = min(a.hi + 1, (c + 1) * a.ck);
++    constexpr int kR = kMaxQ / 8;
++    float q[kR][4], o[kR][4], m[kR], l[kR];
++#pragma unroll
++    for (int r = 0; r < kR; ++r) {
++        const int qi = w + 8 * r;
++        m[r] = -INFINITY;
++        l[r] = 0.0f;
++#pragma unroll
++        for (int i = 0; i < 4; ++i) {
++            o[r][i] = 0.0f;
++            q[r][i] = qi < nq ? bf(a.q[(static_cast<size_t>(qi / g) * a.hq + j * g + qi % g) * kD + lane * 4 + i]) : 0.0f;
++        }
++    }
++    for (int kt = k0; kt < k1; kt += kT) {
++        const int nk = min(kT, k1 - kt);
++        for (int idx = tid; idx < nk * (kD / 8); idx += blockDim.x) {
++            const int kk = idx / (kD / 8), part = idx % (kD / 8);
++            const size_t at = (static_cast<size_t>((kt + kk) % a.ring) * a.hk + j) * kD + part * 8;
++            reinterpret_cast<uint4*>(&sk[kk][0])[part] = *reinterpret_cast<const uint4*>(a.kc + at);
++            reinterpret_cast<uint4*>(&sv[kk][0])[part] = *reinterpret_cast<const uint4*>(a.vc + at);
++        }
++        __syncthreads();
++        for (int kk = 0; kk < nk; ++kk) {
++            const uint2 kw = reinterpret_cast<const uint2*>(&sk[kk][0])[lane];
++            const uint2 vw = reinterpret_cast<const uint2*>(&sv[kk][0])[lane];
++            const float kx[4] = {bf(kw.x & 0xFFFFu), bf(kw.x >> 16), bf(kw.y & 0xFFFFu), bf(kw.y >> 16)};
++            const float vx[4] = {bf(vw.x & 0xFFFFu), bf(vw.x >> 16), bf(vw.y & 0xFFFFu), bf(vw.y >> 16)};
++#pragma unroll
++            for (int r = 0; r < kR; ++r) {
++                float s = q[r][0] * kx[0];
++                s += q[r][1] * kx[1];
++                s += q[r][2] * kx[2];
++                s += q[r][3] * kx[3];
++                s = tf_common::warp_sum(s) * a.scale;
++                const float mx = fmaxf(m[r], s);
++                const float al = expf(m[r] - mx), p = expf(s - mx);
++                l[r] = l[r] * al + p;
++#pragma unroll
++                for (int i = 0; i < 4; ++i) o[r][i] = o[r][i] * al + p * vx[i];
++                m[r] = mx;
++            }
++        }
++        __syncthreads();
++    }
++#pragma unroll
++    for (int r = 0; r < kR; ++r) {
++        const int qi = w + 8 * r;
++        if (qi >= nq) continue;
++        const size_t rh = static_cast<size_t>(blockIdx.x) * nqt + (qi / g) * a.hq + j * g + qi % g;
++#pragma unroll
++        for (int i = 0; i < 4; ++i) a.po[rh * kD + lane * 4 + i] = o[r][i];
++        if (lane == 0) {
++            a.pml[rh * 2] = m[r];
++            a.pml[rh * 2 + 1] = l[r];
++        }
++    }
++}
++
+ // Each (row, head)'s chunks folded in order: out bf16 [T][hq][128].
+ extern "C" __global__ void __launch_bounds__(128) tf_ink2m_merge(const float* __restrict__ po, const float* __restrict__ pml, int chunks,
+                                                                  int nqt, uint16_t* __restrict__ out) {
+@@ -622,6 +693,8 @@ __device__ __forceinline__ float race_u(unsigned long long seed, unsigned pos, u
+ // tf_ink2m_vocab_n over the FP8 phi (n = 1 is tf_ink2m_vocab's shape): base + beta + scale_v * phi8_v . latent.
+ // keys (optional): a sampled stream's logits become its race scores at pos + step, the very noise the target's
+ // keyed draw adds there, so its argmax pick is the token the target samples when the two heads agree.
++// A warp a vocabulary row: every lane holds each stream's dot (warp_sum's butterfly leaves the same bits in all
++// lanes), and lane k finishes stream k's softcap and noise, so up to 32 streams' tails run side by side.
+ extern "C" __global__ void __launch_bounds__(256) tf_ink2m_vocab8_n(const uint16_t* __restrict__ base, long long base_stride,
+                                                                     const uint16_t* __restrict__ latent, const uint8_t* __restrict__ phi,
+                                                                     const float* __restrict__ scales, const uint16_t* __restrict__ beta,
+@@ -633,11 +706,17 @@ extern "C" __global__ void __launch_bounds__(256) tf_ink2m_vocab8_n(const uint16
+     if (v >= nv) return;
+     const uint2 pv = reinterpret_cast<const uint2*>(phi + static_cast<size_t>(v) * 256)[lane];
+     const float bt = bf(beta[v]), sc = scales[v];
+-    for (int st = 0; st < n; ++st) {
+-        const uint4 lv = reinterpret_cast<const uint4*>(latent + static_cast<size_t>(st) * 256)[lane];
+-        const float s = tf_common::warp_sum(dot8(pv, lv)) * sc;
+-        if (lane == 0) {
+-            const float b = bfr(s + bt);
++    for (int st0 = 0; st0 < n; st0 += 32) {
++        const int m = min(32, n - st0);
++        float mine = 0.0f;
++        for (int i = 0; i < m; ++i) {
++            const uint4 lv = reinterpret_cast<const uint4*>(latent + static_cast<size_t>(st0 + i) * 256)[lane];
++            const float s = tf_common::warp_sum(dot8(pv, lv)) * sc;
++            if (lane == i) mine = s;
++        }
++        if (lane < m) {
++            const int st = st0 + lane;
++            const float b = bfr(mine + bt);
+             const float x = bfr(bf(base[st * base_stride + v]) + b);
+             float o = v < valid ? bfr(tanhf(x / cap) * cap) : -INFINITY;
+             if (keys != nullptr && v < valid) {
+diff --git a/zig/src/families/inkling2/mini_dspark.zig b/zig/src/families/inkling2/mini_dspark.zig
+index ee908d7..6dc513d 100644
+--- a/zig/src/families/inkling2/mini_dspark.zig
++++ b/zig/src/families/inkling2/mini_dspark.zig
+@@ -125,6 +125,7 @@ const Kernels = struct {
+     resnorm: cuda.Function,
+     block_qkv: cuda.Function,
+     attn: cuda.Function,
++    attn_w: cuda.Function, // tf_ink2m_attn_w: a warp a query row (attnWarpOn)
+     merge: cuda.Function,
+     swiglu: cuda.Function,
+     kappa: cuda.Function,
+@@ -154,6 +155,7 @@ const Kernels = struct {
+         k.fp8_lane = try mod.function("tf_ink2m_fp8_lane");
+         k.phi8 = try mod.function("tf_ink2m_phi8");
+         k.vocab8_n = try mod.function("tf_ink2m_vocab8_n");
++        k.attn_w = try mod.function("tf_ink2m_attn_w");
+         return k;
+     }
+ };
+@@ -172,8 +174,41 @@ const AttnArgs = extern struct {
+     hi: i32,
+     c0: i32,
+     scale: f32,
++    ck: i32, // keys a block takes (attnChunk)
+ };
+ 
++/// The most chunks one drafter attention call splits its keys into (the partials' room holds at least this many).
++const attn_parts = 32;
++
++/// TF_INKLING2_DRAFT_ATTN_SPLIT=0: every drafter attention block takes a 1,024-key chunk, as before (8 to 16 blocks a
++/// call on short contexts; a block's serial softmax then bounds the call at ~0.6 ms on the GB10).
++fn attnSplitOn() bool {
++    const S = struct {
++        var v: ?bool = null;
++    };
++    if (S.v == null) S.v = if (std.c.getenv("TF_INKLING2_DRAFT_ATTN_SPLIT")) |e| e[0] != '0' else true;
++    return S.v.?;
++}
++
++/// TF_INKLING2_DRAFT_ATTN_WARP=0: tf_ink2m_attn (a thread a score, the softmax a thread a query row) instead of
++/// tf_ink2m_attn_w (a warp a query row, the softmax online in registers).
++fn attnWarpOn() bool {
++    const S = struct {
++        var v: ?bool = null;
++    };
++    if (S.v == null) S.v = if (std.c.getenv("TF_INKLING2_DRAFT_ATTN_WARP")) |e| e[0] != '0' else true;
++    return S.v.?;
++}
++
++/// Keys a drafter attention block takes over [lo, hi]: the smallest of 128, 256, 512 and 1,024 that splits them into
++/// at most attn_parts chunks, so a short context still fills the GPU (the same math a chunk; the merge folds more).
++fn attnChunk(lo: usize, hi: usize) usize {
++    if (!attnSplitOn()) return chunk;
++    var ck: usize = 128;
++    while (ck < chunk and hi / ck - lo / ck + 1 > attn_parts) ck *= 2;
++    return ck;
++}
++
+ /// One stream's draft state: its ring slot, the committed range, the newest f row and the last walk.
+ const Slot = struct {
+     k: [3]u64,
+@@ -458,7 +493,7 @@ pub const Drafter = struct {
+         const H = hidden;
+         const R = absorb_rows;
+         const V = x.vocab;
+-        x.chunks = globalRing(x.context) / chunk + 1;
++        x.chunks = @max(globalRing(x.context) / chunk + 1, attn_parts);
+         x.c = try x.alloc(4 * R * H * 2);
+         x.kv = try x.alloc(R * 2 * kv_width * 2);
+         x.x = try x.alloc(max_batch * block * H * 2);
+@@ -710,12 +745,13 @@ pub const Drafter = struct {
+             const local = i != 1;
+             var lo: usize = @intCast(l.from);
+             if (local and anchor > window) lo = @max(lo, @as(usize, @intCast(anchor)) - window);
+-            const c0 = lo / chunk;
+-            const nc = hi / chunk - c0 + 1;
+-            const aa: AttnArgs = .{ .q = x.q, .kc = sl.k[i], .vc = sl.v[i], .po = x.po, .pml = x.pml, .T = block, .hq = heads, .hk = kv_heads, .ring = @intCast(sl.rings[i]), .lo = @intCast(lo), .hi = @intCast(hi), .c0 = @intCast(c0), .scale = 1.0 / @sqrt(@as(f32, head_dim)) };
++            const ck = attnChunk(lo, hi);
++            const c0 = lo / ck;
++            const nc = hi / ck - c0 + 1;
++            const aa: AttnArgs = .{ .q = x.q, .kc = sl.k[i], .vc = sl.v[i], .po = x.po, .pml = x.pml, .T = block, .hq = heads, .hk = kv_heads, .ring = @intCast(sl.rings[i]), .lo = @intCast(lo), .hi = @intCast(hi), .c0 = @intCast(c0), .scale = 1.0 / @sqrt(@as(f32, head_dim)), .ck = @intCast(ck) };
+             var c: cuda.Args = .{};
+             c.add(aa);
+-            try go(x.k.attn, x.s, .{ .x = @intCast(nc), .y = kv_heads }, 256, &c);
++            try go(if (attnWarpOn()) x.k.attn_w else x.k.attn, x.s, .{ .x = @intCast(nc), .y = kv_heads }, 256, &c);
+             var m: cuda.Args = .{};
+             for ([_]u64{ x.po, x.pml }) |v| m.add(v);
+             m.add(@as(i32, @intCast(nc)));
+@@ -905,12 +941,13 @@ fn encodeBatch(x: *Drafter, bi: []const BatchItem) !void {
+             const local = i != 1;
+             var lo: usize = @intCast(b.l.from);
+             if (local and anchor > window) lo = @max(lo, @as(usize, @intCast(anchor)) - window);
+-            const c0 = lo / chunk;
+-            const nc = hi / chunk - c0 + 1;
+-            const aa: AttnArgs = .{ .q = x.q + s * block * q_width * 2, .kc = sl.k[i], .vc = sl.v[i], .po = x.po, .pml = x.pml, .T = block, .hq = heads, .hk = kv_heads, .ring = @intCast(sl.rings[i]), .lo = @intCast(lo), .hi = @intCast(hi), .c0 = @intCast(c0), .scale = 1.0 / @sqrt(@as(f32, head_dim)) };
++            const ck = attnChunk(lo, hi);
++            const c0 = lo / ck;
++            const nc = hi / ck - c0 + 1;
++            const aa: AttnArgs = .{ .q = x.q + s * block * q_width * 2, .kc = sl.k[i], .vc = sl.v[i], .po = x.po, .pml = x.pml, .T = block, .hq = heads, .hk = kv_heads, .ring = @intCast(sl.rings[i]), .lo = @intCast(lo), .hi = @intCast(hi), .c0 = @intCast(c0), .scale = 1.0 / @sqrt(@as(f32, head_dim)), .ck = @intCast(ck) };
+             var e: cuda.Args = .{};
+             e.add(aa);
+-            try go(x.k.attn, x.s, .{ .x = @intCast(nc), .y = kv_heads }, 256, &e);
++            try go(if (attnWarpOn()) x.k.attn_w else x.k.attn, x.s, .{ .x = @intCast(nc), .y = kv_heads }, 256, &e);
+             var m: cuda.Args = .{};
+             for ([_]u64{ x.po, x.pml }) |v| m.add(v);
+             m.add(@as(i32, @intCast(nc)));
