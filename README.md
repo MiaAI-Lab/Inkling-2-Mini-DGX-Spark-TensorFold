@@ -14,7 +14,7 @@
 Serve **[Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)** on a single **NVIDIA DGX Spark** (GB10, `sm_121`, 128 GB
 unified memory) through an OpenAI-compatible API (plus a `/v1/messages` Messages-format endpoint). It runs [TensorFold](https://github.com/ashhart/TensorFold)'s Zig engine
 (`tensorfold-native`, Jürgen Schmied's Inkling 2 Mini CUDA engine at [PR #4441](https://github.com/ashhart/TensorFold/pull/4441), commit
-`dc2ca8a1`) plus `patches/0001`–`0018` in NVIDIA's PyTorch container. It has native CUDA vision (`inkling2_vision`: PNG, JPEG, WebP) and
+`dc2ca8a1`) plus `patches/0001`–`0028` in NVIDIA's PyTorch container. It has native CUDA vision (`inkling2_vision`: PNG, JPEG, WebP) and
 structured output and tool calling (`libtfgrammar.so`).
 
 - **Model:** a looped mixture of experts.
@@ -44,10 +44,36 @@ structured output and tool calling (`libtfgrammar.so`).
   - **262,144** tokens a stream (the model's limit is 1,048,576) and **8** concurrent streams.
   - `fp8` KV cache, the DFlash2 drafter (`DRAFTS=1`, `DRAFTER=dflash2`) and native CUDA vision (`VISION=1`).
   - Structured output and `tool_choice`.
-  - FP8 attention projections (`TF_INKLING2_ATTN_FP8=1`) and Blackwell native FP4/MXFP8 prefill tensor cores (`TF_INKLING2_PREFILL_TC=1`).
+  - FP8 attention projections (`TF_INKLING2_ATTN_FP8=1`), Blackwell native FP4/MXFP8 prefill tensor cores (`TF_INKLING2_PREFILL_TC=1`), and FP8 tensor-core prompt attention projections (`TF_INKLING2_ATTN_FP8_TC=1`).
 - **One command:** `./start.sh` downloads the weights, builds the `sm_121` image on the first run and starts the server; `./stop.sh` stops it.
 
 ## Performance
+
+### sparkDash (DFlash2, patches `0001`–`0028`)
+
+Measured with [sparkDash](https://github.com/MiaAI-Lab/sparkDash/) on one **NVIDIA DGX Spark** (GB10, `sm_121`). Settings:
+`Inkling-2-Mini-Derisked`, `CONTEXT=262144`, `PARALLEL=8`, `KV_DTYPE=fp8`, `DRAFTS=1` (`DRAFTER=dflash2`), `TF_INKLING2_ATTN_FP8=1`,
+`TF_INKLING2_PREFILL_TC=1`, `TF_INKLING2_ATTN_FP8_TC=1`.
+
+#### Prefill
+
+| Context | tok/s | TTFT | Prompt tokens |
+| --- | ---: | ---: | ---: |
+| 4k | **3,868.8 tok/s** | 1.23 s | 4,126 |
+| 8k | **3,734.4 tok/s** | 2.37 s | 8,226 |
+| 16k | **3,680.4 tok/s** | 4.63 s | 16,419 |
+| 32k | **3,547.9 tok/s** | 9.41 s | 32,800 |
+| 64k | **3,267.1 tok/s** | 20.23 s | 65,570 |
+| 128k | **2,827.0 tok/s** | 46.54 s | 131,103 |
+
+#### Decode (Prose, `temp 0.7` · thinking on · `top_k 20` · DFlash2 drafts)
+
+| Streams | Prose agg | Prose / stream | TTFT |
+| --- | ---: | ---: | ---: |
+| ×1 | **64.3 tok/s** | 64.3 tok/s | 71 ms |
+| ×2 | **99.0 tok/s** | 50.1 tok/s | 306 ms |
+| ×4 | **128.5 tok/s** | 34.6 tok/s | 376 ms |
+| ×8 | **196.4 tok/s** | 26.0 tok/s | 722 ms |
 
 ### DFlash2 vs DSpark decode
 
@@ -197,7 +223,8 @@ On a 128 GB DGX Spark with the defaults (`CONTEXT=262144`, `PARALLEL=8`, `KV_DTY
 Every stream reserves its full `CONTEXT` window at startup. For exact serving:
 - `KV_DTYPE=bf16` (with, say, `PARALLEL=4`) for bf16 KV caches;
 - `TF_INKLING2_ATTN_FP8=0` for bf16 attention projections;
-- `TF_INKLING2_PREFILL_TC=0` for bf16 prefill experts.
+- `TF_INKLING2_PREFILL_TC=0` for bf16 prefill experts;
+- `TF_INKLING2_ATTN_FP8_TC=0` for bf16-activation prompt attention projections.
 
 ## Configuration
 
@@ -224,6 +251,7 @@ All defaults live in [`scripts/config.sh`](scripts/config.sh). Override them fro
 | `TENSORFOLD_MEMORY_RESERVE_GIB` | `9` | memory kept free when sizing the KV and prompt-cache pool |
 | `TF_INKLING2_ATTN_FP8` | `1` | FP8 attention projections (`0` for exact bf16) |
 | `TF_INKLING2_PREFILL_TC` | `1` | Blackwell native FP4/MXFP8 prefill tensor cores (`0` for exact bf16 MMA) |
+| `TF_INKLING2_ATTN_FP8_TC` | `1` | FP8 tensor-core prompt attention projections (`0` for exact bf16 activations; decode stays bf16) |
 | `NATIVE_FP_DECODE` | `1` | build with `-Dnative-fp-decode` (sm_121a's native FP4/FP8 decode in the expert kernels; exact) |
 
 ### API notes
@@ -242,7 +270,7 @@ All defaults live in [`scripts/config.sh`](scripts/config.sh). Override them fro
 - **Exact serial reference:** `"draft": false` on any request turns drafting off. Drafted replies match `"draft": false` token for token.
 - **Admission:** when all `PARALLEL` slots are full, new requests are rejected rather than queued.
 
-## Patches (`patches/0001`–`0018`)
+## Patches (`patches/0001`–`0028`)
 
 Applied in order onto TensorFold `dc2ca8a1` (PR #4441) by `scripts/prepare.sh`:
 
@@ -257,6 +285,7 @@ Applied in order onto TensorFold `dc2ca8a1` (PR #4441) by `scripts/prepare.sh`:
 | `0016` | Native CUDA vision encoder (`inkling2_vision`): `Inkling2ImageProcessor` (PNG/JPEG/WebP, EXIF orientation, 8×8 checkerboard alpha, `-1.0` padding to 40×40 tiles), the 23-layer ViT with 2D pairwise axial RoPE, LayerScale and bilinear position embeddings, `vision_kernel<64, 8>` tensor-core attention, the 2×2 spatial merge and GELU projector, and image embeddings spliced into the prompt (`--vision`) |
 | `0017` | Server fixes: the reply grammar is freed when a stream fails to start (`lane_stream.zig`); opt-in `TF_TOOL_CALL_GUARD=1` and rejected tool-envelope logs (`TF_TOOL_CALL_DEBUG=1`); `--vision-max-images` up to 100; `--dashboard-open` |
 | `0018` | DFlash2 drafter (`mini_dflash.zig`, `inkling2/dflash.cu`): `--drafter` on a DFlash2 folder loads it in place of DSpark. Committed taps go through `fc` and the hidden norm into 5 layers' 2,048-position K/V rings; one pass embeds the pending token and 7 masks and runs the two-tap dynamic convs, non-causal block attention and SwiGLU (layers as FP8 copies); an NVFP4 copy of the target head gives each row's top 16, and a GPU candidate selector walks the path (keyed draws for sampled requests). A stream alone gives the round planner each draft's chance, the selector's probability calibrated by what landed. After TensorFold's GLM-5.3-Flash CUDA DFlash2 and [tonyd2wild](https://github.com/tonyd2wild)'s [Inkling DFlash2 patch](https://github.com/tonyd2wild/Inkling-2-Mini-NVFP4-DGX-Spark) |
+| `0019`–`0028` | Decode and prefill speedups: calibrated 64-row `shared_costs` and DFlash2 `hold_costs`; skip expired DFlash2 prompt ingest and unread last-visit prompt rows; batched DFlash2 ingest, FP8 `fc`/`kv`, graphed holds, shared ring attention and two-pass radix top-16 selector; fused activation quantization in TC MoE up epilogue; opt-in FP8 tensor-core prompt attention projections (`TF_INKLING2_ATTN_FP8_TC=1`); async raw fp8 K/V prompt attention staging with native `e4m3x2` dequant and trimmed global `grid.z`; native `e2m1x2`/`e4m3x2` decode expert unpacking; 128×128 exact FP8 prompt projections; fused decode K/V 4-tap conv + prep |
 
 ## Tools
 
@@ -276,7 +305,7 @@ Applied in order onto TensorFold `dc2ca8a1` (PR #4441) by `scripts/prepare.sh`:
 start.sh      set up (first run) and start the server
 stop.sh       stop it
 scripts/      config.sh, prepare.sh, fetch.sh, banner.sh
-patches/      0001–0018 applied onto TensorFold at TF_REF
+patches/      0001–0028 applied onto TensorFold at TF_REF
 tools/        verification scripts
 CREDITS.md    upstream credits
 NOTICE        third-party notices
@@ -297,7 +326,7 @@ libjpeg-turbo and libwebp, which it builds.
 
 ## Credits
 
-- **Recipe & patches (`0001`–`0003`, `0005`–`0018`):** created and built by **[MiaAI-Lab](https://github.com/MiaAI-Lab)** (Mia's AI Lab). That
+- **Recipe & patches (`0001`–`0003`, `0005`–`0028`):** created and built by **[MiaAI-Lab](https://github.com/MiaAI-Lab)** (Mia's AI Lab). That
   includes:
   - CUDA DSpark and DFlash2 drafting, `--kv-cache fp8`, and decode and prefill kernel optimizations;
   - 4,096-row passes, wide verify CUDA graphs, and Blackwell native FP4/MXFP8 prefill tensor cores;
