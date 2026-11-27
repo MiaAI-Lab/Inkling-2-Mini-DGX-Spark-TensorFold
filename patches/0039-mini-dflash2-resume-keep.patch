@@ -1,0 +1,196 @@
+diff --git a/zig/src/families/inkling2/mini_dflash.zig b/zig/src/families/inkling2/mini_dflash.zig
+index 689e3f7..ca89faf 100644
+--- a/zig/src/families/inkling2/mini_dflash.zig
++++ b/zig/src/families/inkling2/mini_dflash.zig
+@@ -194,8 +194,38 @@ const Slot = struct {
+     ring: u64,
+     walk: u64,
+     used: bool = false,
++    // a released stream's context, still in the ring until another stream writes over it (TF_INKLING2_DRAFT_KEEP)
++    kept: std.ArrayList(u32) = .empty, // its committed tokens [0, kept_end)
++    kept_from: u64 = 0, // the rows [kept_from, kept_end) it had absorbed
++    kept_end: u64 = 0,
++    released: u64 = 0, // release order (0: never held a stream): a new stream without a match takes the oldest
+ };
+ 
++/// Rows a kept context must give a resumed prompt to be worth taking over.
++const keep_min = 64;
++
++/// The first row a ring kept through `end` (absorbed from `from`) still holds: its last window (a hold writes no row).
++fn keptFrom(from: u64, end: u64) u64 {
++    return @max(from, end -| window);
++}
++
++/// TF_INKLING2_DRAFT_KEEP=0: a prompt resumed from the target's prompt cache drafts from the resumed rows alone, as
++/// before. Default on: a free slot keeps its last stream's ring, and a stream whose restored prompt matches it attends
++/// that context instead of starting cold (proposals only; the target verifies every draft).
++fn keepOn() bool {
++    const S = struct {
++        var v: ?bool = null;
++    };
++    if (S.v == null) S.v = if (std.c.getenv("TF_INKLING2_DRAFT_KEEP")) |e| e[0] != '0' else true;
++    return S.v.?;
++}
++
++/// TF_INKLING2_RESUME_TRACE=1: a line a resumed prompt (whether its context came from a kept ring).
++fn resumeTrace() bool {
++    const v = std.c.getenv("TF_INKLING2_RESUME_TRACE") orelse return false;
++    return v[0] == '1';
++}
++
+ const LaneState = struct {
+     slot: usize,
+     from: u64 = 0, // the first committed position the ring holds for this sequence (a resumed prompt starts past 0)
+@@ -277,6 +307,8 @@ pub const Drafter = struct {
+     slots: std.ArrayList(Slot) = .empty,
+     slot_bufs: std.ArrayList(DeviceBuffer) = .empty,
+     lanes: std.AutoHashMapUnmanaged(*Stream, LaneState) = .empty,
++    releases: u64 = 0, // slots released so far (a slot's `released` orders them)
++    resumes: [2]u64 = @splat(0), // resumed prompts that found a kept ring, and that started cold
+     passes: u64 = 0,
+     landing: lanes.draft_tree.Landing = .{},
+     chances: bool = false,
+@@ -589,6 +621,7 @@ pub const Drafter = struct {
+             g.* = null;
+         };
+         x.lanes.deinit(x.gpa);
++        for (x.slots.items) |*sl| sl.kept.deinit(x.gpa);
+         for (x.slot_bufs.items) |*b| b.free();
+         x.slot_bufs.deinit(x.gpa);
+         x.slots.deinit(x.gpa);
+@@ -644,9 +677,7 @@ pub const Drafter = struct {
+     fn openFn(ptr: *anyopaque, s: *Stream) anyerror!void {
+         const x = self(ptr);
+         if (x.lanes.contains(s)) return error.DraftStreamOpen;
+-        const slot = for (x.slots.items, 0..) |sl, i| {
+-            if (!sl.used) break i;
+-        } else blk: {
++        const slot = pick(x.slots.items, s.prompt(), keepOn() and s.images.len == 0) orelse blk: {
+             try x.reserve(@intCast(x.slots.items.len + 1)); // past the host's count: one more, if it fits
+             break :blk x.slots.items.len - 1;
+         };
+@@ -656,7 +687,40 @@ pub const Drafter = struct {
+ 
+     fn releaseFn(ptr: *anyopaque, s: *Stream) void {
+         const x = self(ptr);
+-        if (x.lanes.fetchRemove(s)) |e| x.slots.items[e.value.slot].used = false;
++        const e = x.lanes.fetchRemove(s) orelse return;
++        const sl = &x.slots.items[e.value.slot];
++        sl.used = false;
++        x.releases += 1;
++        sl.released = x.releases;
++        sl.kept.clearRetainingCapacity();
++        sl.kept_from = 0;
++        sl.kept_end = 0;
++        const l = e.value;
++        if (!keepOn() or s.images.len > 0 or l.end <= l.from or s.context.items.len < l.end) return;
++        sl.kept.appendSlice(x.gpa, s.context.items[0..@intCast(l.end)]) catch return; // no room: nothing kept
++        sl.kept_from = l.from;
++        sl.kept_end = l.end;
++    }
++
++    /// The first row a stream resumed at `start` (its prompt restored from the target's cache) can attend in its
++    /// slot's kept ring: tokens [0, start) must be the kept stream's and the ring must still hold keep_min rows of them.
++    fn resumeFrom(s: *const Stream, sl: *const Slot, start: u64) ?u64 {
++        if (!keepOn() or s.images.len > 0 or sl.kept_end == 0 or start > sl.kept_end) return null;
++        const n: usize = @intCast(start);
++        if (s.context.items.len < n or sl.kept.items.len < n) return null;
++        if (!std.mem.eql(u32, sl.kept.items[0..n], s.context.items[0..n])) return null;
++        const from = keptFrom(sl.kept_from, sl.kept_end);
++        if (from + keep_min > start) return null;
++        return from;
++    }
++
++    /// A resumed prompt's first rows at `start`: attend from the slot's kept ring (not before `floor`) when it holds this
++    /// prompt's context, else from `start` as before; counted, and traced with TF_INKLING2_RESUME_TRACE=1.
++    fn resumeKept(x: *Drafter, l: *LaneState, s: *const Stream, start: u64, floor: u64) void {
++        const kept = resumeFrom(s, &x.slots.items[l.slot], start);
++        if (kept) |from| l.from = @max(from, floor);
++        x.resumes[@intFromBool(kept == null)] += 1;
++        if (resumeTrace()) std.log.info("Inkling 2 Mini DFlash2: resumed at {d} {s}, attending rows {d}..{d}; kept {d}, cold {d}", .{ start, if (kept != null) "from a kept ring" else "cold", l.from, start, x.resumes[0], x.resumes[1] });
+     }
+ 
+     /// The stream's last walk on the host (one sync per round, then a small read).
+@@ -834,7 +898,11 @@ pub const Drafter = struct {
+                 const want_start = @max(item.start, live_from);
+                 const skip: usize = @intCast(want_start - item.start);
+                 const n: usize = f.rows - skip;
+-                if (item.start > l.end or l.end == 0) l.from = want_start else l.from = @max(l.from, live_from);
++                if (item.start > l.end or l.end == 0) {
++                    l.from = want_start;
++                    // rows [live_from, start) of a resumed prompt are not in this chunk: the kept ring may hold them
++                    if (l.end == 0 and item.start > live_from) x.resumeKept(l, item.stream, item.start, live_from);
++                } else l.from = @max(l.from, live_from);
+                 const sl = &x.slots.items[l.slot];
+                 try x.ingest(sl.ring, f.buffer + f.offset + skip * row_bytes, want_start, n);
+                 traced_rows += n;
+@@ -843,7 +911,11 @@ pub const Drafter = struct {
+                 l.fetched = false;
+                 continue;
+             }
+-            if (item.start > l.end or l.end == 0) l.from = item.start; // a gap (a resumed prompt): attend from here
++            if (item.start > l.end or l.end == 0) {
++                // a gap (a resumed prompt): attend from here, or from the slot's kept ring when it is this prompt's
++                l.from = item.start;
++                if (l.end == 0 and item.start > 0) x.resumeKept(l, item.stream, item.start, 0);
++            }
+             const sl = &x.slots.items[l.slot];
+             // only the last window of rows can be attended to: earlier ones would be overwritten in the ring
+             const skip: usize = @as(usize, f.rows) -| window;
+@@ -1169,6 +1241,56 @@ fn top16RadixOn() bool {
+     return S.v.?;
+ }
+ 
++/// The free slot whose kept context shares the longest prefix with `prompt` when `match`, else the one released longest
++/// ago; null: every slot is taken. A slot counts only when the shared prefix reaches keep_min rows into what its ring still
++/// holds, so a prompt that merely shares a system prompt does not take over a ring it cannot resume from.
++fn pick(slots: []const Slot, prompt: []const u32, match: bool) ?usize {
++    var best: ?usize = null;
++    var best_len: usize = keep_min - 1;
++    var oldest: ?usize = null;
++    for (slots, 0..) |sl, i| {
++        if (sl.used) continue;
++        if (oldest == null or sl.released < slots[oldest.?].released) oldest = i;
++        if (!match or sl.kept_end == 0) continue;
++        const n = std.mem.indexOfDiff(u32, sl.kept.items, prompt) orelse @min(sl.kept.items.len, prompt.len);
++        if (n < keptFrom(sl.kept_from, sl.kept_end) + keep_min) continue;
++        if (n > best_len) {
++            best = i;
++            best_len = n;
++        }
++    }
++    return best orelse oldest;
++}
++
++test "a resumed prompt takes the free slot that kept its prefix, else the oldest; a ring keeps its last window" {
++    const t = std.testing;
++    const a = t.allocator;
++    var slots: [3]Slot = .{ .{ .ring = 0, .walk = 0, .released = 2 }, .{ .ring = 0, .walk = 0, .released = 1 }, .{ .ring = 0, .walk = 0, .released = 3 } };
++    defer for (&slots) |*sl| sl.kept.deinit(a);
++    var prompt: [200]u32 = undefined;
++    for (&prompt, 0..) |*p, i| p.* = @intCast(i + 7);
++    try t.expectEqual(@as(?usize, 1), pick(&slots, &prompt, true)); // nothing kept: the oldest release
++    try slots[2].kept.appendSlice(a, prompt[0..150]);
++    slots[2].kept_end = 150;
++    try t.expectEqual(@as(?usize, 2), pick(&slots, &prompt, true));
++    try t.expectEqual(@as(?usize, 1), pick(&slots, &prompt, false)); // images, or TF_INKLING2_DRAFT_KEEP=0
++    slots[2].used = true;
++    try t.expectEqual(@as(?usize, 1), pick(&slots, &prompt, true));
++    slots[2].used = false;
++    slots[2].kept_from = 100; // the ring holds rows 100..150: a 150-row shared prefix reaches only 50 into it
++    try t.expectEqual(@as(?usize, 1), pick(&slots, &prompt, true));
++    slots[2].kept_from = 80;
++    try t.expectEqual(@as(?usize, 2), pick(&slots, &prompt, true));
++    slots[2].kept_from = 0;
++    prompt[40] = 1; // now shares 40 < keep_min tokens: not worth taking
++    try t.expectEqual(@as(?usize, 1), pick(&slots, &prompt, true));
++    for (&slots) |*sl| sl.used = true;
++    try t.expectEqual(@as(?usize, null), pick(&slots, &prompt, true));
++    try t.expectEqual(@as(u64, 0), keptFrom(0, 1500));
++    try t.expectEqual(@as(u64, 3000 - window), keptFrom(10, 3000));
++    try t.expectEqual(@as(u64, 2000), keptFrom(2000, 3000));
++}
++
+ test "a ring holds a window of every layer's K and V" {
+     try std.testing.expectEqual(@as(usize, 5 * 2 * 2048 * 1024 * 2), ring_bytes);
+     try std.testing.expectEqual(@as(usize, 576), dyn_width);

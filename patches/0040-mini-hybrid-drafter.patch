@@ -1,0 +1,658 @@
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index 00b0043..10c4f69 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -92,6 +92,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+     const mods = family(b, target, optimize, cuda, draft_ids);
+     const cli = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cuda_main.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip });
+     const native = engines(b, target, optimize, cuda, mods.core, mods.lanes, mods.nemotron, mods.heat, mods.qwen35, mods.qwen_vision);
++    b.step("test-lanes-lone-chances-host", "Lanes: a drafter's lone-only chances leave the host config as without chances (Facts.chances_lone)").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mods.lanes, .filters = &.{"lone chances"} })).step);
+     for ([_]struct { []const u8, *std.Build.Module }{ .{ "cuda", cuda }, .{ "core", mods.core }, .{ "lanes", mods.lanes }, .{ "nemotron", mods.nemotron }, .{ "dory", native.engines.import_table.get("dory").? }, .{ "cluster", @import("cluster_cuda.zig").module(b, target, optimize, mods.lanes, mods.core, native.canon, native.verbs) } }) |m| cli.addImport(m[0], m[1]);
+     cli.addOptions("build_options", build_options);
+     cli.addImport("checkpoint_cli", checkpointCli(b, target, optimize, strip, native.engines, mods.core));
+diff --git a/zig/src/core/lanes/config.zig b/zig/src/core/lanes/config.zig
+index 94c0237..b7d3446 100644
+--- a/zig/src/core/lanes/config.zig
++++ b/zig/src/core/lanes/config.zig
+@@ -49,6 +49,7 @@ pub const Model = struct {
+     draft_probabilities: bool = false, // the head gives each drafted node's chance of landing
+     granted_depth: bool = false, // with draft_probabilities: every stream drafts its last grant plus a slack
+     draft_slack: u32 = 0, // drafts past a stream's last grant, short or not (0: the Constants' own)
++    lone_chances: ?LoneChances = null, // Facts.chances_lone: the chance fields for a lone priced stream's steps; the fields above stay as without chances
+     draft_streams: bool = false, // the head drafts every stream of a shared round in one batch
+     plain_streams: u32 = 0, // a shared round with this many streams or more drafts none (0: off)
+     copy_first: bool = false, // a copy ahead takes the round: the head holds no drafts for it (a drafter's own pass)
+@@ -65,6 +66,9 @@ pub const Model = struct {
+     lone_copies: bool = true, // a lone stream proposes copies (false: only streams in shared rounds do)
+ };
+ 
++/// A drafter's chances for a lone stream only (Facts.chances_lone): its slack and confidence floor.
++pub const LoneChances = struct { slack: u32 = 0, confidence: ?f64 = null };
++
+ pub const Config = struct {
+     allocate_shared_drafts: bool = false, // reserve useful shared head rows before a proposal pass
+     limit_shared_drafts: bool = false, // retain the cost rule's depth cap before reserving shared rows
+@@ -86,6 +90,7 @@ pub const Config = struct {
+     batch_streams: u32,
+     node_probabilities: bool,
+     granted_depth: bool = false, // Model.granted_depth
++    lone_chances: ?LoneChances = null, // Model.lone_chances (Engine.chanceStep swaps in lone())
+     plain_streams: u32 = 0, // Model.plain_streams
+     fill_lanes: u32 = 0, // rows a window may grow to with suffix-match branches (0: off; lanes/fill.zig)
+     fill_match: u32 = 8, // context tokens a suffix-match branch must match (shorter ones are coincidental phrases)
+@@ -124,6 +129,8 @@ pub const Config = struct {
+         const width: u32 = @max(1, @min(@max(m.exact_width, 1), max_rows));
+         if (m.draft_confidence) |floor| if (!(floor >= 0 and floor <= 1)) return error.InvalidDraftConfidence;
+         if (m.head_trees and m.draft_confidence != null) return error.DraftConfidenceNeedsChain;
++        if (m.lone_chances) |lc| if (lc.confidence) |floor| if (!(floor >= 0 and floor <= 1)) return error.InvalidDraftConfidence;
++        if (m.lone_chances) |lc| if (m.head_trees and lc.confidence != null) return error.DraftConfidenceNeedsChain;
+         const max_copy = if (m.copy_drafts) width - 1 else 0;
+         const first_rows: i64 = if (m.first_copy_rows != 0) m.first_copy_rows else width;
+         const first_copy: u32 = @intCast(@max(1, @min(@as(i64, max_copy), first_rows - 1)));
+@@ -176,6 +183,7 @@ pub const Config = struct {
+             .batch_streams = if (streams) (if (m.max_streams != 0) m.max_streams else 32) else 1,
+             .node_probabilities = m.draft_probabilities or m.draft_confidence != null,
+             .granted_depth = m.granted_depth and m.draft_probabilities,
++            .lone_chances = m.lone_chances,
+             .plain_streams = m.plain_streams,
+             .draft_streams = m.draft_streams,
+             .head_trees = m.head_trees,
+@@ -206,6 +214,23 @@ pub const Config = struct {
+         };
+     }
+ 
++    /// This config with Model.lone_chances applied as drafted.facts applies Facts.chances (the slices shared, never freed
++    /// through the copy): what a step of one priced stream runs under.
++    pub fn lone(c: *const Config) Config {
++        var o = c.*;
++        const lc = c.lone_chances orelse return o;
++        const probs = lc.confidence == null;
++        o.draft_confidence = lc.confidence;
++        o.node_probabilities = probs or lc.confidence != null;
++        o.granted_depth = probs;
++        if (lc.slack > 0) {
++            o.k.draft_slack = lc.slack;
++            o.k.grant_slack = lc.slack;
++            o.k.short_slack = lc.slack;
++        }
++        return o;
++    }
++
+     pub fn deinit(c: *Config, gpa: Allocator) void {
+         gpa.free(c.depth_prior);
+         c.family_costs.deinit(gpa);
+@@ -242,3 +267,28 @@ test "shared cost consumer: lone measured windows stay out of shared MTP prices"
+         for (shared) |cost| try std.testing.expectEqual(@as(?f64, cost.ms), explicit.shared_costs.get(cost.width));
+     }
+ }
++
++test "lone chances: the host's config keeps the plain fields, Config.lone() only the chance ones" {
++    const gpa = std.testing.allocator;
++    const m: Model = .{ .exact_width = 8, .drafts = 7, .mtp = true, .speculate = true, .batch_rows = 16, .lone_chances = .{ .slack = 7 } };
++    var base = try Config.init(gpa, m, 8, 7);
++    defer base.deinit(gpa);
++    var plain_m = m;
++    plain_m.lone_chances = null;
++    var plain = try Config.init(gpa, plain_m, 8, 7);
++    defer plain.deinit(gpa);
++    // the host's config is the one without chances
++    try std.testing.expect(!base.node_probabilities and !base.granted_depth and base.draft_confidence == null);
++    try std.testing.expectEqual(plain.k, base.k);
++    const l = base.lone();
++    try std.testing.expect(l.node_probabilities and l.granted_depth and l.draft_confidence == null);
++    try std.testing.expectEqual(@as(i64, 7), l.k.draft_slack);
++    try std.testing.expectEqual(@as(i64, 7), l.k.grant_slack);
++    try std.testing.expectEqual(@as(i64, 7), l.k.short_slack);
++    base.lone_chances = .{ .slack = 0, .confidence = 0.4 };
++    const f = base.lone();
++    try std.testing.expect(f.node_probabilities and !f.granted_depth and f.draft_confidence.? == 0.4);
++    try std.testing.expectEqual(plain.k.grant_slack, f.k.grant_slack);
++    base.lone_chances = null;
++    try std.testing.expect(!base.lone().node_probabilities);
++}
+diff --git a/zig/src/core/lanes/drafted.zig b/zig/src/core/lanes/drafted.zig
+index 55c06db..0bcbefe 100644
+--- a/zig/src/core/lanes/drafted.zig
++++ b/zig/src/core/lanes/drafted.zig
+@@ -124,7 +124,10 @@ pub const Drafted = struct {
+         m.head_trees = d.trees;
+         m.copy_first = d.copy_first;
+         m.hold_costs = d.hold_costs;
+-        if (d.chances and x.drafter.vtable.chances != null) {
++        if (d.chances and d.chances_lone and x.drafter.vtable.chances != null and d.tree_nodes == 0) {
++            // chances for a lone priced stream only: every field above stays as without chances (Engine.chanceStep)
++            m.lone_chances = .{ .slack = d.slack, .confidence = d.confidence_floor };
++        } else if (d.chances and x.drafter.vtable.chances != null) {
+             // a chain's drafts priced by the drafter's own chances; the next hold as deep as the grant and its slack
+             m.draft_probabilities = d.confidence_floor == null;
+             m.draft_confidence = d.confidence_floor;
+diff --git a/zig/src/core/lanes/drafter.zig b/zig/src/core/lanes/drafter.zig
+index 66628bc..badcce1 100644
+--- a/zig/src/core/lanes/drafter.zig
++++ b/zig/src/core/lanes/drafter.zig
+@@ -24,6 +24,8 @@ pub const Facts = struct {
+     chances: bool = false, // chances() gives each held chain draft's chance: verify rows go by them (Model.granted_depth)
+     confidence_floor: ?f64 = null, // with chances: every round drafts the deepest chain and verifies drafts this likely
+     slack: u32 = 0, // with chances: drafts a hold offers past the stream's last grant (0: the depth rule's own)
++    chances_lone: bool = false, // with chances: they (and slack) apply only to a step whose one live stream the drafter prices (chances() true); every other step runs the rule as without chances
++
+     copy_first: bool = false, // a hold costs a pass of its own: none is asked for a stream with a copy ahead
+     hold_costs: []const @import("hold_price.zig").HoldCost = &.{}, // that pass's ms by blocks and depth (timed at load)
+ };
+diff --git a/zig/src/core/lanes/engine.zig b/zig/src/core/lanes/engine.zig
+index 987adae..8d37424 100644
+--- a/zig/src/core/lanes/engine.zig
++++ b/zig/src/core/lanes/engine.zig
+@@ -54,6 +54,9 @@ pub const Engine = struct {
+     arena: std.heap.ArenaAllocator, // a round's temporaries
+     unread: std.ArrayList(Unread) = .empty, // queued draws the log reads at the step's end
+     price_log: ?bool = null, // TF_SHARED_PRICE_LOG, read at the first priced shared round (lanes/price_log.zig)
++    base_cfg: ?*const Config = null, // the host's config once chanceStep swapped one in (Model.lone_chances)
++    lone_cfg: ?*Config = null, // Config.lone() of it: a step of one priced stream (Facts.chances_lone)
++    chance_step: bool = false, // this step runs under lone_cfg
+     pub fn init(gpa: Allocator, cfg: *const Config, backend: be.Backend, clock: be.Clock) Engine {
+         return .{
+             .gpa = gpa,
+@@ -84,6 +87,7 @@ pub const Engine = struct {
+     }
+ 
+     pub fn deinit(e: *Engine) void {
++        if (e.lone_cfg) |c| e.gpa.destroy(c);
+         e.grammar_workers.deinit(e.gpa);
+         e.live.deinit(e.gpa);
+         e.unread.deinit(e.gpa);
+@@ -92,6 +96,49 @@ pub const Engine = struct {
+         e.arena.deinit();
+     }
+ 
++    /// Facts.chances_lone: a step whose one live stream the drafter prices (its chances() answers for it) runs under
++    /// Config.lone(), with the rule's chance fields to match; every other step (a stream the drafter gives no chances,
++    /// a shared round) under the host's own config, exactly as without chances. No-op without Model.lone_chances.
++    pub fn chanceStep(e: *Engine, lone: ?*Stream) !void {
++        if (!try e.ensureLone()) return;
++        e.setChances(if (lone) |s| e.prices(s) else false);
++    }
++
++    /// The lone config made once (false: the host's config has no lone chances).
++    pub fn ensureLone(e: *Engine) !bool {
++        const base = e.base_cfg orelse e.cfg;
++        if (base.lone_chances == null) return false;
++        e.base_cfg = base;
++        if (e.lone_cfg == null) {
++            const c = try e.gpa.create(Config);
++            c.* = base.lone();
++            e.lone_cfg = c;
++        }
++        return true;
++    }
++
++    /// Run under the lone config (`on`) or the host's (ensureLone first).
++    pub fn setChances(e: *Engine, on: bool) void {
++        const c: *const Config = if (on) e.lone_cfg.? else e.base_cfg.?;
++        e.cfg = c;
++        e.chance_step = on;
++        e.rule.node_probabilities = c.node_probabilities;
++        e.rule.granted_depth = c.granted_depth;
++        e.rule.confidence_floor = c.draft_confidence;
++        e.rule.k.draft_slack = c.k.draft_slack;
++        e.rule.k.grant_slack = c.k.grant_slack;
++        e.rule.k.short_slack = c.k.short_slack;
++    }
++
++    /// Whether the drafter gives `s` chances now: an empty ask (no drafts read), or with a confidence floor one real
++    /// chance, so a stream holding no draft is never priced by a floor it cannot answer.
++    fn prices(e: *Engine, s: *Stream) bool {
++        const p = e.backend.vtable.probabilities orelse return false;
++        const floor = if (e.base_cfg) |b| if (b.lone_chances) |lc| lc.confidence != null else false else false;
++        var one: [1]f64 = undefined;
++        return p(e.backend.ptr, s, if (floor) one[0..1] else one[0..0]) catch false;
++    }
++
+     /// Streams holding or about to hold a row (paused ones included).
+     pub fn activeCount(e: *const Engine) usize {
+         var n: usize = 0;
+@@ -139,6 +186,8 @@ pub const Engine = struct {
+             live.shrinkRetainingCapacity(kept);
+         }
+         e.alone = live.items.len == 1;
++        try e.chanceStep(if (live.items.len == 1) live.items[0] else null);
++        defer if (e.chance_step) e.setChances(false); // between steps the host's own config is always in place
+         if (!e.alone) for (live.items) |s| {
+             s.shared_round = true;
+         };
+@@ -571,3 +620,74 @@ test "per-depth draft counters: a chain's rows by position, a tree's by its pare
+     for (s.depth_offered) |v| off += v;
+     try std.testing.expectEqual(@as(u32, 7), off);
+ }
++
++test "lone chances: Engine.chanceStep runs a lone priced stream under Config.lone(), any other step as without chances" {
++    const gpa = std.testing.allocator;
++    const Stub = struct {
++        var priced = false;
++        fn probabilities(_: *anyopaque, _: *Stream, _: []f64) anyerror!bool {
++            return priced;
++        }
++        fn prefill(_: *anyopaque, _: *Stream) anyerror!void {}
++        fn first(_: *anyopaque, _: *Stream, _: u64) anyerror!u64 {
++            return 0;
++        }
++        fn queue(_: *anyopaque, _: *Stream, _: be.Feed, _: u64) anyerror!u64 {
++            return 0;
++        }
++        fn read(_: *anyopaque, _: u64) anyerror!u32 {
++            return 0;
++        }
++        fn verify(_: *anyopaque, _: []const be.Window, _: []be.Verified) anyerror!void {}
++        fn keep(_: *anyopaque, _: []const be.Window, _: []const []const u32) anyerror!void {}
++        fn draft(_: *anyopaque, _: []const be.DraftRequest) anyerror!void {}
++        fn release(_: *anyopaque, _: *Stream) void {}
++        fn start(_: *anyopaque) void {}
++        fn elapsed(_: *anyopaque, _: be.Mark) f64 {
++            return 0;
++        }
++    };
++    var dummy: u8 = 0;
++    const vt: be.Backend.VTable = .{ .prefill = Stub.prefill, .first = Stub.first, .queue = Stub.queue, .read = Stub.read, .verify = Stub.verify, .keep = Stub.keep, .draft = Stub.draft, .release = Stub.release, .probabilities = Stub.probabilities };
++    const backend: be.Backend = .{ .ptr = &dummy, .vtable = &vt };
++    const clock_vt: be.Clock.VTable = .{ .start = Stub.start, .elapsed_ms = Stub.elapsed };
++    const clock: be.Clock = .{ .ptr = &dummy, .vtable = &clock_vt };
++    const m: @import("config.zig").Model = .{ .exact_width = 8, .drafts = 7, .mtp = true, .speculate = true, .batch_rows = 16, .lone_chances = .{ .slack = 7 } };
++    var cfg = try Config.init(gpa, m, 8, 7);
++    defer cfg.deinit(gpa);
++    var e = Engine.init(gpa, &cfg, backend, clock);
++    defer e.deinit();
++    var s: Stream = undefined;
++    const plain_slack = e.rule.k.draft_slack;
++    // a lone stream the drafter prices: the lone config and the rule's chance fields
++    Stub.priced = true;
++    try e.chanceStep(&s);
++    try std.testing.expect(e.chance_step and e.cfg == e.lone_cfg.? and e.rule.granted_depth and e.rule.node_probabilities);
++    try std.testing.expectEqual(@as(i64, 7), e.rule.k.draft_slack);
++    // a lone stream it does not price (another drafter's), and a shared round: the host's config, as without chances
++    Stub.priced = false;
++    try e.chanceStep(&s);
++    try std.testing.expect(!e.chance_step and e.cfg == &cfg and !e.rule.granted_depth and !e.rule.node_probabilities);
++    try std.testing.expectEqual(plain_slack, e.rule.k.draft_slack);
++    Stub.priced = true;
++    try e.chanceStep(null);
++    try std.testing.expect(!e.chance_step and e.cfg == &cfg);
++    // back to a priced lone step, then the step's end (step()'s defer) restores the host's config
++    try e.chanceStep(&s);
++    try std.testing.expect(e.cfg == e.lone_cfg.?);
++    if (e.chance_step) e.setChances(false);
++    try std.testing.expect(e.cfg == &cfg and e.rule.k.draft_slack == plain_slack);
++    // without Model.lone_chances nothing switches
++    var plain_m = m;
++    plain_m.lone_chances = null;
++    var plain = try Config.init(gpa, plain_m, 8, 7);
++    defer plain.deinit(gpa);
++    var e2 = Engine.init(gpa, &plain, backend, clock);
++    defer e2.deinit();
++    try e2.chanceStep(&s);
++    try std.testing.expect(!e2.chance_step and e2.cfg == &plain and e2.lone_cfg == null);
++    // a confidence floor outside [0, 1] is refused at startup, as Model.draft_confidence is
++    var bad = m;
++    bad.lone_chances = .{ .confidence = 1.5 };
++    try std.testing.expectError(error.InvalidDraftConfidence, Config.init(gpa, bad, 8, 7));
++}
+diff --git a/zig/src/core/lanes/open.zig b/zig/src/core/lanes/open.zig
+index fa389f3..6a7ddac 100644
+--- a/zig/src/core/lanes/open.zig
++++ b/zig/src/core/lanes/open.zig
+@@ -144,6 +144,17 @@ fn openedCommitted(e: *Engine, s: *Stream, reach: Reach, hook: ?be.Committed) !v
+ 
+ /// The first drafts' depth for `reach`.
+ pub fn firstDepth(e: *Engine, s: *Stream, reach: Reach) !u32 {
++    // lone chances: a stream's first drafts are sized as without chances (its drafter may not price it yet)
++    if (try e.ensureLone()) {
++        const was = e.chance_step;
++        e.setChances(false);
++        defer e.setChances(was);
++        return firstDepthIn(e, s, reach);
++    }
++    return firstDepthIn(e, s, reach);
++}
++
++fn firstDepthIn(e: *Engine, s: *Stream, reach: Reach) !u32 {
+     var who = win.who(s);
+     const d = if (reach == .head and e.cfg.node_probabilities) try e.rule.headDepth(&who, null, win.probe(e)) else try e.rule.depth(who);
+     return @intCast(if (e.cfg.shared_mtp_cap > 0 and e.live.items.len > 0) @min(d, e.cfg.shared_mtp_cap) else d); // joins a shared round
+diff --git a/zig/src/families/inkling2/inkling2.zig b/zig/src/families/inkling2/inkling2.zig
+index 503aaaa..a5ce6ac 100644
+--- a/zig/src/families/inkling2/inkling2.zig
++++ b/zig/src/families/inkling2/inkling2.zig
+@@ -36,6 +36,7 @@ test {
+     _ = mini_dspark;
+     _ = mini_dflash;
+     _ = @import("mini_stash.zig");
++    _ = @import("mini_hybrid.zig");
+     _ = mini_backend;
+     _ = mini_snap;
+     _ = @import("mini_pages.zig");
+diff --git a/zig/src/families/inkling2/mini_dflash.zig b/zig/src/families/inkling2/mini_dflash.zig
+index ca89faf..2422ee6 100644
+--- a/zig/src/families/inkling2/mini_dflash.zig
++++ b/zig/src/families/inkling2/mini_dflash.zig
+@@ -209,6 +209,12 @@ fn keptFrom(from: u64, end: u64) u64 {
+     return @max(from, end -| window);
+ }
+ 
++/// Whether a prompt of `prompt_len` tokens resumed at `start` would attend kept rows: keep_min of them inside the
++/// window its first block attends (a resume below that floor restores nothing the prompt reads).
++pub fn windowResumes(prompt_len: u64, start: u64) bool {
++    return start >= (prompt_len -| window) + keep_min;
++}
++
+ /// TF_INKLING2_DRAFT_KEEP=0: a prompt resumed from the target's prompt cache drafts from the resumed rows alone, as
+ /// before. Default on: a free slot keeps its last stream's ring, and a stream whose restored prompt matches it attends
+ /// that context instead of starting cold (proposals only; the target verifies every draft).
+@@ -702,6 +708,15 @@ pub const Drafter = struct {
+         sl.kept_end = l.end;
+     }
+ 
++    /// Whether a free slot's kept ring holds the context of `s` resumed at `start` (the combined drafter routes by it).
++    pub fn holdsContext(x: *const Drafter, s: *const Stream, start: u64) bool {
++        if (start == 0 or !windowResumes(s.prompt_len, start)) return false;
++        for (x.slots.items) |*sl| {
++            if (!sl.used and resumeFrom(s, sl, start) != null) return true;
++        }
++        return false;
++    }
++
+     /// The first row a stream resumed at `start` (its prompt restored from the target's cache) can attend in its
+     /// slot's kept ring: tokens [0, start) must be the kept stream's and the ring must still hold keep_min rows of them.
+     fn resumeFrom(s: *const Stream, sl: *const Slot, start: u64) ?u64 {
+@@ -1289,6 +1304,7 @@ test "a resumed prompt takes the free slot that kept its prefix, else the oldest
+     try t.expectEqual(@as(u64, 0), keptFrom(0, 1500));
+     try t.expectEqual(@as(u64, 3000 - window), keptFrom(10, 3000));
+     try t.expectEqual(@as(u64, 2000), keptFrom(2000, 3000));
++    try t.expect(!windowResumes(3800, 1700) and windowResumes(3800, 1816) and windowResumes(1500, 64) and !windowResumes(1500, 63));
+ }
+ 
+ test "a ring holds a window of every layer's K and V" {
+diff --git a/zig/src/families/inkling2/mini_hybrid.zig b/zig/src/families/inkling2/mini_hybrid.zig
+new file mode 100644
+index 0000000..de096cc
+--- /dev/null
++++ b/zig/src/families/inkling2/mini_hybrid.zig
+@@ -0,0 +1,231 @@
++//! Inkling 2 Mini's two drafters behind one (TF_INKLING2_DSPARK_DIR with a DFlash2 --drafter): DFlash2 for prompts
++//! shorter than a limit, DSpark from there on. DFlash2's layers see the last 2,048 rows only, while DSpark's global
++//! layer sees the whole context, so DSpark drafts long grounded prompts better. A stream keeps the drafter it opened
++//! with; both read the same taps. A prompt resumed from the prompt cache opens on the drafter that holds its context
++//! when only the other one does (DFlash2's kept rings, DSpark's kept slots and stash): a conversation that began below
++//! the limit and grew past it keeps DFlash2 up to TF_INKLING2_DFLASH2_FOLLOW_MAX prompt tokens, and a short prompt whose
++//! cached prefix only DSpark drafted takes DSpark; either way the resumed rows are not drafted cold.
++const std = @import("std");
++const lanes = @import("lanes");
++const dspark = @import("mini_dspark.zig");
++const dflash = @import("mini_dflash.zig");
++
++const dr = lanes.drafter;
++const Stream = lanes.Stream;
++
++/// TF_INKLING2_DFLASH2_MAX_PROMPT: prompts of at least this many tokens draft with DSpark.
++pub fn limitFromEnv() usize {
++    const v = std.c.getenv("TF_INKLING2_DFLASH2_MAX_PROMPT") orelse return default_limit;
++    return std.fmt.parseInt(usize, std.mem.trim(u8, std.mem.span(v), " \t\r\n"), 10) catch default_limit;
++}
++pub const default_limit = 2048;
++
++/// TF_INKLING2_DFLASH2_FOLLOW_MAX: a resumed prompt whose context only DFlash 2 holds drafts with DFlash 2 below this
++/// many prompt tokens (default twice the limit; 0: never at or past the limit). Past it, DSpark takes over and drafts
++/// the resumed rows cold once (from ~4K tokens DSpark drafts grounded tasks far better).
++pub fn followFromEnv(limit: usize) usize {
++    const v = std.c.getenv("TF_INKLING2_DFLASH2_FOLLOW_MAX") orelse return 2 * limit;
++    return std.fmt.parseInt(usize, std.mem.trim(u8, std.mem.span(v), " \t\r\n"), 10) catch 2 * limit;
++}
++
++/// Which drafter a stream opens on, and why.
++pub const Route = enum {
++    short, // below the limit: DFlash 2
++    long, // at or past it: DSpark
++    follow_df, // resumed past the limit, its context only in DFlash 2 (below the follow limit)
++    follow_ds, // resumed below the limit, its context only in DSpark
++
++    pub fn dflash2(r: Route) bool {
++        return r == .short or r == .follow_df;
++    }
++};
++
++/// The drafter for a prompt of `prompt_len` tokens resumed at `start` (0: not resumed); `df_has` / `ds_has`: whether
++/// each holds the resumed rows' context.
++pub fn routeOf(limit: usize, follow: usize, prompt_len: usize, start: u64, df_has: bool, ds_has: bool) Route {
++    if (prompt_len < limit) return if (start > 0 and ds_has and !df_has) .follow_ds else .short;
++    return if (start > 0 and prompt_len < follow and df_has and !ds_has) .follow_df else .long;
++}
++
++const max_items = 64;
++
++pub const Hybrid = struct {
++    gpa: std.mem.Allocator,
++    ds: *dspark.Drafter,
++    df: *dflash.Drafter,
++    limit: usize,
++    follow: usize, // followFromEnv
++    short: std.AutoHashMapUnmanaged(*Stream, bool) = .empty, // true: the stream drafts with DFlash 2
++    routes: [4]u64 = @splat(0), // opened streams by Route
++
++    pub fn init(gpa: std.mem.Allocator, ds: *dspark.Drafter, df: *dflash.Drafter, limit: usize) !*Hybrid {
++        const h = try gpa.create(Hybrid);
++        h.* = .{ .gpa = gpa, .ds = ds, .df = df, .limit = limit, .follow = followFromEnv(limit) };
++        return h;
++    }
++
++    pub fn deinit(h: *Hybrid) void {
++        h.short.deinit(h.gpa);
++        h.df.deinit();
++        h.ds.deinit();
++        h.gpa.destroy(h);
++    }
++
++    pub fn fixedBytes(h: *const Hybrid) usize {
++        return h.ds.fixedBytes() + h.df.fixedBytes();
++    }
++
++    pub fn reserve(h: *Hybrid, streams: u32) !void {
++        try h.ds.reserve(streams);
++        try h.df.reserve(streams);
++    }
++
++    pub fn drafter(h: *Hybrid) dr.Drafter {
++        return .{ .kind = "DFlash2+DSpark", .ptr = h, .vtable = &.{ .taps = tapsFn, .facts = factsFn, .open = openFn, .absorb = absorbFn, .hold = holdFn, .held = heldFn, .release = releaseFn, .chances = chancesFn } };
++    }
++
++    fn self(ptr: *anyopaque) *Hybrid {
++        return @ptrCast(@alignCast(ptr));
++    }
++
++    fn tapsFn(_: *anyopaque) []const u32 {
++        return &dspark.taps;
++    }
++
++    /// DSpark's facts (its hold prices), with a stream's bytes for both drafters' caches; with DFlash 2's chances on
++    /// (TF_INKLING2_DFLASH2_CHANCES=1) its chance facts too: a DFlash 2 stream alone prices its drafts by them, every
++    /// other stream (DSpark's, or any in a shared round) gives none and keeps the per-depth rates.
++    fn factsFn(ptr: *anyopaque) dr.Facts {
++        const h = self(ptr);
++        var f = h.ds.drafter().facts();
++        const g = h.df.drafter().facts();
++        f.stream_bytes += g.stream_bytes;
++        if (g.chances) {
++            f.chances = true;
++            f.slack = g.slack;
++            f.confidence_floor = g.confidence_floor;
++            f.chances_lone = !h.df.chances_shared; // chances (and their slack) only for a lone DFlash2 stream's steps
++        }
++        return f;
++    }
++
++    /// DFlash 2's chances for its stream when no other stream (of either drafter) is open, unless shared chances are on.
++    fn chancesFn(ptr: *anyopaque, s: *Stream, out: []f64) anyerror!bool {
++        const h = self(ptr);
++        const short = h.short.get(s) orelse return false;
++        if (!short) return false;
++        if (h.short.count() > 1 and !h.df.chances_shared) return false;
++        return h.df.drafter().chances(s, out);
++    }
++
++    fn isShort(h: *const Hybrid, s: *Stream) !bool {
++        return h.short.get(s) orelse error.DraftStreamUnknown;
++    }
++
++    /// The stream's drafter (routeOf). The lanes open a drafter after the target's first prompt step, its restore
++    /// from the prompt cache done: s.cached is where the stream resumed.
++    fn openFn(ptr: *anyopaque, s: *Stream) anyerror!void {
++        const h = self(ptr);
++        const start: u64 = s.cached;
++        const r = if (start == 0) routeOf(h.limit, h.follow, s.prompt_len, 0, false, false) else routeOf(h.limit, h.follow, s.prompt_len, start, h.df.holdsContext(s, start), h.ds.holdsContext(s, start));
++        const use_df = r.dflash2();
++        h.routes[@intFromEnum(r)] += 1;
++        // TF_INKLING2_RESUME_TRACE=1: every stream's drafter (which drafter served a request, for the gates)
++        if (dspark.resumeTrace()) std.log.info("Inkling 2 Mini drafters: stream {s} prompt {d} resumed at {d}: {s} ({s}); routes short {d}, long {d}, follow_df {d}, follow_ds {d}", .{ s.id, s.prompt_len, start, if (use_df) "DFlash 2" else "DSpark", @tagName(r), h.routes[0], h.routes[1], h.routes[2], h.routes[3] });
++        try h.short.ensureUnusedCapacity(h.gpa, 1); // before the child opens: no slot left open on a failed put
++        if (use_df) try h.df.drafter().open(s) else try h.ds.drafter().open(s);
++        h.short.putAssumeCapacity(s, use_df);
++    }
++
++    fn releaseFn(ptr: *anyopaque, s: *Stream) void {
++        const h = self(ptr);
++        const e = h.short.fetchRemove(s) orelse return;
++        if (e.value) h.df.drafter().release(s) else h.ds.drafter().release(s);
++    }
++
++    fn absorbFn(ptr: *anyopaque, items: []const dr.Absorb) anyerror!void {
++        const h = self(ptr);
++        if (items.len > max_items) return error.DraftTooManyItems;
++        var a: [max_items]dr.Absorb = undefined;
++        var b: [max_items]dr.Absorb = undefined;
++        var na: usize = 0;
++        var nb: usize = 0;
++        for (items) |it| {
++            if (try h.isShort(it.stream)) {
++                a[na] = it;
++                na += 1;
++            } else {
++                b[nb] = it;
++                nb += 1;
++            }
++        }
++        if (na > 0) try h.df.drafter().absorb(a[0..na]);
++        if (nb > 0) try h.ds.drafter().absorb(b[0..nb]);
++    }
++
++    fn holdFn(ptr: *anyopaque, items: []const dr.Hold) anyerror!void {
++        const h = self(ptr);
++        if (items.len > max_items) return error.DraftTooManyItems;
++        var a: [max_items]dr.Hold = undefined;
++        var b: [max_items]dr.Hold = undefined;
++        var na: usize = 0;
++        var nb: usize = 0;
++        for (items) |it| {
++            if (try h.isShort(it.stream)) {
++                a[na] = it;
++                na += 1;
++            } else {
++                b[nb] = it;
++                nb += 1;
++            }
++        }
++        if (na > 0) try h.df.drafter().hold(a[0..na]);
++        if (nb > 0) try h.ds.drafter().hold(b[0..nb]);
++    }
++
++    /// Each drafter's streams in one call (one stream sync each, not one a stream).
++    fn heldFn(ptr: *anyopaque, streams: []const *Stream, out: []const []u32) anyerror!void {
++        const h = self(ptr);
++        if (streams.len > max_items) return error.DraftTooManyItems;
++        var as: [max_items]*Stream = undefined;
++        var ao: [max_items][]u32 = undefined;
++        var bs: [max_items]*Stream = undefined;
++        var bo: [max_items][]u32 = undefined;
++        var na: usize = 0;
++        var nb: usize = 0;
++        for (streams, out) |s, o| {
++            if (try h.isShort(s)) {
++                as[na] = s;
++                ao[na] = o;
++                na += 1;
++            } else {
++                bs[nb] = s;
++                bo[nb] = o;
++                nb += 1;
++            }
++        }
++        if (na > 0) try h.df.drafter().held(as[0..na], ao[0..na]);
++        if (nb > 0) try h.ds.drafter().held(bs[0..nb], bo[0..nb]);
++    }
++};
++
++test "a resumed prompt follows the drafter that holds its context, DFlash 2 only below the follow limit" {
++    const t = std.testing;
++    // not resumed, or both / neither hold it: the limit decides
++    try t.expectEqual(Route.short, routeOf(2048, 4096, 1500, 0, false, true));
++    try t.expectEqual(Route.long, routeOf(2048, 4096, 2300, 0, true, false));
++    try t.expectEqual(Route.short, routeOf(2048, 4096, 1500, 1200, true, true));
++    try t.expectEqual(Route.long, routeOf(2048, 4096, 2300, 2200, false, false));
++    // a conversation that grew past the limit keeps DFlash 2 while only it holds the context, below the follow limit
++    try t.expectEqual(Route.follow_df, routeOf(2048, 4096, 2300, 2200, true, false));
++    try t.expectEqual(Route.long, routeOf(2048, 4096, 4096, 4000, true, false));
++    try t.expectEqual(Route.long, routeOf(2048, 0, 2300, 2200, true, false));
++    // a turn of 3,800 tokens resumed at 1,700 (below its last window, 1,752..3,800): DFlash 2 would restore
++    // nothing, so it does not count as holding the context (holdsContext) and DSpark takes the prompt whole
++    try t.expectEqual(Route.long, routeOf(2048, 4096, 3800, 1700, dflash.windowResumes(3800, 1700), false));
++    try t.expectEqual(Route.follow_df, routeOf(2048, 4096, 3800, 1816, dflash.windowResumes(3800, 1816), false));
++    // a short prompt whose cached prefix only DSpark drafted
++    try t.expectEqual(Route.follow_ds, routeOf(2048, 4096, 1800, 1500, false, true));
++    try t.expect(Route.follow_df.dflash2() and Route.short.dflash2() and !Route.long.dflash2() and !Route.follow_ds.dflash2());
++    try t.expectEqual(@as(usize, 4096), followFromEnv(2048));
++}
+diff --git a/zig/src/families/inkling2/mini_native.zig b/zig/src/families/inkling2/mini_native.zig
+index 8222a26..50cf2b2 100644
+--- a/zig/src/families/inkling2/mini_native.zig
++++ b/zig/src/families/inkling2/mini_native.zig
+@@ -10,6 +10,7 @@ const be = @import("mini_backend.zig");
+ const snap = @import("mini_snap.zig");
+ const dspark = @import("mini_dspark.zig");
+ const dflash = @import("mini_dflash.zig");
++const hybrid = @import("mini_hybrid.zig");
+ const mini_vision = @import("mini_vision.zig");
+ const mini_pages = @import("mini_pages.zig");
+ 
+@@ -156,6 +157,19 @@ pub fn openDrafter(gpa: std.mem.Allocator, io: std.Io, p: *anyopaque, dir: []con
+     const own: *Owned = @ptrCast(@alignCast(p));
+     if (own.b.lanes.count() != 0) return error.TapsAfterStreams;
+     if (dflash.isDFlash2(gpa, io, dir)) {
++        // TF_INKLING2_DSPARK_DIR (the checkpoint folder): DSpark too, for prompts of TF_INKLING2_DFLASH2_MAX_PROMPT
++        // tokens (default 2,048) and more (mini_hybrid.zig)
++        if (std.c.getenv("TF_INKLING2_DSPARK_DIR")) |dd| {
++            const ds = try dspark.Drafter.init(gpa, io, own.m.d, own.s, &own.w, &own.k, own.m.context, std.mem.span(dd));
++            errdefer ds.deinit();
++            if (own.draft_pages) ds.pageGlobal(own.m.device, own.m.pages.?.g.rowsPerPage());
++            const f = try dflash.Drafter.init(gpa, io, own.m.d, own.s, &own.w, &own.k, own.m.context, dir);
++            errdefer f.deinit();
++            const h = try hybrid.Hybrid.init(gpa, ds, f, hybrid.limitFromEnv());
++            own.m.drafter_window = null; // DSpark reads every prompt row's taps: no prompt trim
++            std.log.info("Inkling 2 Mini drafters: DFlash2 ({s}) below {d} prompt tokens, DSpark ({s}) from there; {d:.2} GiB fixed, {d:.2} GiB a stream{s}", .{ dir, h.limit, std.mem.span(dd), gib(h.fixedBytes()), gib(dflash.laneBytes() + ds.streamBytes()), if (own.draft_pages) " (DSpark's global ring on leased pages)" else "" });
++            return .{ .drafter = h.drafter(), .ctx = h, .close = closeHybrid, .reserve = reserveHybrid };
++        }
+         const d = try dflash.Drafter.init(gpa, io, own.m.d, own.s, &own.w, &own.k, own.m.context, dir);
+         own.m.drafter_window = dflash.window;
+         std.log.info("Inkling 2 Mini DFlash2: {d} drafts a block from {s} (Apache-2.0), {s} head, chances {s}, {d:.2} GiB fixed, {d:.2} GiB a stream", .{ dflash.depth, dir, if (d.head) |h| (if (h.mode == .fp4) "nvfp4" else "fp8") else "bf16", if (d.chances) "lone streams" else "off", gib(d.fixedBytes()), gib(dflash.laneBytes()) });
+@@ -178,6 +192,16 @@ fn reserveDrafter(p: *anyopaque, streams: u32) anyerror!void {
+     try d.reserve(streams);
+ }
+ 
++fn closeHybrid(p: *anyopaque) void {
++    const h: *hybrid.Hybrid = @ptrCast(@alignCast(p));
++    h.deinit();
++}
++
++fn reserveHybrid(p: *anyopaque, streams: u32) anyerror!void {
++    const h: *hybrid.Hybrid = @ptrCast(@alignCast(p));
++    try h.reserve(streams);
++}
++
+ fn closeDFlash(p: *anyopaque) void {
+     const d: *dflash.Drafter = @ptrCast(@alignCast(p));
+     d.deinit();

@@ -1,0 +1,56 @@
+diff --git a/zig/src/core/lane_host_fill.zig b/zig/src/core/lane_host_fill.zig
+index 290796d..cf645b9 100644
+--- a/zig/src/core/lane_host_fill.zig
++++ b/zig/src/core/lane_host_fill.zig
+@@ -156,7 +156,7 @@ pub fn run(h: *LaneHost) void {
+     while (pick(h, .short)) |at| {
+         if (budget > 0 and used >= budget) return; // the budget's rows are in: the decoders' round comes first
+         if (!h.filling.items[at].fill_began) {
+-            if (burst == h.info_.lanes and (runnable(h) > 0 or pick(h, .long) != null)) break;
++            if (burst == shortBurst(h.info_.lanes) and (runnable(h) > 0 or pick(h, .long) != null)) break;
+             burst += 1;
+         }
+         const counted = budget > 0 and runnable(h) > 0; // a stream that opened earlier in this visit waits from here
+@@ -175,7 +175,7 @@ fn policyRun(h: *LaneHost) void {
+     var burst: usize = 0;
+     while (pick(h, .short)) |at| {
+         if (!h.filling.items[at].fill_began) {
+-            if (burst == h.info_.lanes and (runnable(h) > 0 or pick(h, .long) != null)) break;
++            if (burst == shortBurst(h.info_.lanes) and (runnable(h) > 0 or pick(h, .long) != null)) break;
+             burst += 1;
+         }
+         _ = step(h, at);
+@@ -288,9 +288,31 @@ fn srptStep(h: *LaneHost, at: usize, decoding: bool) u64 {
+     return rows;
+ }
+ 
+-/// A prompt whose whole pass is at most `short_rows` rows (a long prompt's last rows are not).
++/// A prompt whose whole pass is at most `shortRows()` rows (a long prompt's last rows are not).
+ fn short(j: *const LaneHost.Job) bool {
+-    return j.stream.prompt_len -| j.stream.cached <= Share.short_rows;
++    return j.stream.prompt_len -| j.stream.cached <= shortRows();
++}
++
++/// TENSORFOLD_PREFILL_SHORT_BURST: the most short prompts begun back to back in a visit while streams decode (default
++/// the lane count): a lower burst lets the decoders' round, and the first visible tokens of the prompts already in,
++/// come sooner, at a longer fill phase.
++pub fn shortBurst(lanes: usize) usize {
++    const S = struct {
++        var v: ?usize = null;
++    };
++    if (S.v == null) S.v = if (std.c.getenv("TENSORFOLD_PREFILL_SHORT_BURST")) |t| (std.fmt.parseInt(usize, std.mem.trim(u8, std.mem.span(t), " \t"), 10) catch 0) else 0;
++    return if (S.v.? > 0) @min(S.v.?, lanes) else lanes;
++}
++
++/// TENSORFOLD_PREFILL_SHORT_ROWS: the most rows a prompt has left to fill and still go whole, back to back with the
++/// other short ones (a lane count of them a visit) before the next decode round; default `Share.short_rows`.
++/// Longer prompts take one call a visit between decode rounds.
++pub fn shortRows() u64 {
++    const S = struct {
++        var v: ?u64 = null;
++    };
++    if (S.v == null) S.v = if (std.c.getenv("TENSORFOLD_PREFILL_SHORT_ROWS")) |t| (std.fmt.parseInt(u32, std.mem.trim(u8, std.mem.span(t), " \t"), 10) catch Share.short_rows) else Share.short_rows;
++    return S.v.?;
+ }
+ 
+ /// Fill chunks' cap: the flag or a default past the threshold, a chunk-invariant family and live decoders; else 0.

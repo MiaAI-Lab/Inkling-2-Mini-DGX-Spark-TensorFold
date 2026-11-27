@@ -1,0 +1,756 @@
+diff --git a/zig/src/families/inkling2/inkling2.zig b/zig/src/families/inkling2/inkling2.zig
+index 334c04c..503aaaa 100644
+--- a/zig/src/families/inkling2/inkling2.zig
++++ b/zig/src/families/inkling2/inkling2.zig
+@@ -35,6 +35,7 @@ test {
+     _ = mini_weights;
+     _ = mini_dspark;
+     _ = mini_dflash;
++    _ = @import("mini_stash.zig");
+     _ = mini_backend;
+     _ = mini_snap;
+     _ = @import("mini_pages.zig");
+diff --git a/zig/src/families/inkling2/mini_dspark.zig b/zig/src/families/inkling2/mini_dspark.zig
+index ea644c7..fc6ef9d 100644
+--- a/zig/src/families/inkling2/mini_dspark.zig
++++ b/zig/src/families/inkling2/mini_dspark.zig
+@@ -10,6 +10,8 @@ const config = @import("config.zig");
+ const wts = @import("mini_weights.zig");
+ const mm = @import("mini_model.zig");
+ const ops = @import("ops.zig");
++const stash = @import("mini_stash.zig");
++const mini_pages = @import("mini_pages.zig");
+ 
+ const dr = lanes.drafter;
+ const Stream = lanes.Stream;
+@@ -40,6 +42,7 @@ const cap = 30.0;
+ /// Streams one batched hold encodes and walks together (their weight reads shared); more are taken in groups.
+ pub const max_batch = 8;
+ const HoldCost = lanes.hold_price.HoldCost;
++
+ /// A hold pass's ms on one GB10 (TF_INKLING2_DRAFT_TRACE=1, 2026-11-23): by streams held together, 1 and 7 drafts deep.
+ const batched_costs = [_]HoldCost{
+     .{ .streams = 1, .depth = 1, .ms = 4.4 }, .{ .streams = 1, .depth = 7, .ms = 6.85 },
+@@ -98,11 +101,38 @@ pub fn globalRing(context: usize) usize {
+     return std.mem.alignForward(usize, context + block, 128);
+ }
+ 
+-/// A stream's caches: two sliding rings and the global ring (K and V bf16), the newest f row and the walk.
+-pub fn laneBytes(context: usize) usize {
+-    return 2 * 2 * local_ring * kv_width * 2 + 2 * globalRing(context) * kv_width * 2 + hidden * 2 + 256;
++/// A stream's caches: two sliding rings and the global ring (K and V bf16), the newest f row and the walk. `paged`:
++/// the global ring is on leased pages (pagedRing), charged per token instead; a 4 MiB share of its zero page stays.
++pub fn laneBytes(context: usize, paged: bool) usize {
++    const global = if (paged) 4 << 20 else 2 * globalRing(context) * kv_width * 2;
++    return 2 * 2 * local_ring * kv_width * 2 + global + hidden * 2 + 256;
++}
++
++/// TF_INKLING2_DRAFT_PAGES=1 (with TF_INKLING2_SHARED_KV=1): DSpark's global ring on VMM pages mapped as its rows are
++/// written and given back when the stream ends, leased per request with the target's pages (the family adds
++/// page_token_bytes to a token's cost) instead of a whole window (1.07 GiB at 262K) a stream at load.
++pub fn pagesOn() bool {
++    const v = std.mem.trim(u8, std.mem.span(std.c.getenv("TF_INKLING2_DRAFT_PAGES") orelse return false), " \t\r\n");
++    return v.len > 0 and v[0] == '1';
+ }
+ 
++/// A token's bytes in a paged global ring: its K and V rows.
++pub const page_token_bytes = 2 * kv_width * 2;
++
++/// A paged global ring's rows: the window and a block past it, whole pages of up to 4 MiB (2,048 rows of 2 KiB).
++pub fn pagedRing(context: usize) usize {
++    return std.mem.alignForward(usize, context + block, 2048);
++}
++
++/// Where a paged global ring's mapping ends when rows up to `end` are written: the end of the lease quantum `end`
++/// falls in (ensureGlobal), within the ring.
++pub fn mappedEnd(context: usize, lease_rows: u64, end: u64) u64 {
++    return @min(std.mem.alignForward(u64, end, @max(1, lease_rows)), pagedRing(context));
++}
++
++/// mini_pages positions a global row takes (its 2 KiB as 256-byte plane rows).
++const page_rows = kv_width * 2 / mini_pages.row_bytes;
++
+ const Layer = struct {
+     qkv: Lane, // [q | k | v][H]
+     ctx: Lane, // [k_ctx | v_ctx][H]
+@@ -227,18 +257,9 @@ const Slot = struct {
+ /// Rows a kept context must give a resumed prompt to be worth taking over.
+ const keep_min = 64;
+ 
+-/// TF_INKLING2_DRAFT_STASH_MIB: device MiB (allocated at load, so the stream budget counts them) for released
+-/// streams' contexts copied out of their slots, so a resumed prompt finds its context after its slot was reused
+-/// (default 512, ~36 contexts of 1.2K tokens, about as many prompts as a 7-8 GiB prompt cache keeps; 0: none, only a
+-/// still-free slot's).
+-fn stashBytes() usize {
+-    const v = std.c.getenv("TF_INKLING2_DRAFT_STASH_MIB") orelse return 512 << 20;
+-    const n = std.fmt.parseInt(usize, std.mem.span(v), 10) catch return 512 << 20;
+-    return n << 20;
+-}
+-
+-/// A released stream's context in the stash: its tokens [0, end), rows [from, end) of the global layer and the two
+-/// sliding rings whole, at `off`: [k0 ring][v0 ring][k2 ring][v2 ring][k1 rows][v1 rows].
++/// A released stream's context in the stash (mini_stash.zig, TF_INKLING2_DRAFT_STASH_MIB): its tokens [0, end), rows
++/// [from, end) of the global layer and the two sliding rings whole, at `off`: [k0 ring][v0 ring][k2 ring][v2 ring][k1
++/// rows][v1 rows]; `id` its room while the stash still holds it.
+ const Stashed = struct {
+     tokens: std.ArrayList(u32) = .empty,
+     from: u64,
+@@ -246,6 +267,7 @@ const Stashed = struct {
+     off: usize,
+     bytes: usize,
+     order: u64,
++    id: u64,
+ };
+ 
+ fn ringBytes() usize {
+@@ -285,7 +307,7 @@ fn keepOn() bool {
+ const Resume = enum { slot, stash, cold };
+ 
+ /// TF_INKLING2_RESUME_TRACE=1: a line a resumed prompt (where its context came from, the counts so far).
+-fn resumeTrace() bool {
++pub fn resumeTrace() bool {
+     const S = struct {
+         var v: ?bool = null;
+     };
+@@ -354,20 +376,41 @@ pub const Drafter = struct {
+     weight_bytes: usize = 0,
+     slots: std.ArrayList(Slot) = .empty,
+     releases: u64 = 0, // streams released so far (each slot's release order)
+-    stash: u64 = 0, // TF_INKLING2_DRAFT_STASH_MIB of device memory for released contexts (0: none)
+-    stash_cap: usize = 0,
+-    stash_at: usize = 0, // where the next stashed context goes (a ring: older entries it overlaps are dropped)
++    own_stash: stash.Arena = .{}, // TF_INKLING2_DRAFT_STASH_MIB of device memory for released contexts (no base: none)
++    ar: *stash.Arena = undefined, // own_stash, which the combined drafter's DFlash 2 shares
+     stashed: std.ArrayList(Stashed) = .empty,
+     slot_bufs: std.ArrayList(DeviceBuffer) = .empty,
+     lanes: std.AutoHashMapUnmanaged(*Stream, LaneState) = .empty,
+     resumes: [3]u64 = @splat(0), // resumed prompts by where their context came from (Resume)
++    page_device: ?cuda.abi.Device = null, // pageGlobal: the global ring on pages (opened with the slots, `reserve`)
++    pg: ?*mini_pages.Pages = null,
++    lease_rows: u64 = 1, // pageGlobal: the ledger's lease quantum in tokens (the target's rows a page)
+ 
+     fn stashBytesHeld(x: *const Drafter) usize {
+         var n: usize = 0;
+-        for (x.stashed.items) |e| n += e.bytes;
++        for (x.stashed.items) |e| {
++            if (x.ar.holds(e.id)) n += e.bytes;
++        }
+         return n;
+     }
+ 
++    /// The stash (its room shared with the combined drafter's DFlash 2, mini_stash.zig).
++    pub fn stashArena(x: *Drafter) *stash.Arena {
++        return x.ar;
++    }
++
++    /// Entries whose room the stash gave to a newer one (this drafter's or the other's) leave the index.
++    fn pruneStash(x: *Drafter) void {
++        var i: usize = 0;
++        while (i < x.stashed.items.len) {
++            const e = &x.stashed.items[i];
++            if (!x.ar.holds(e.id)) {
++                e.tokens.deinit(x.gpa);
++                _ = x.stashed.swapRemove(i);
++            } else i += 1;
++        }
++    }
++
+     fn alloc(x: *Drafter, bytes: usize) !u64 {
+         var b = try DeviceBuffer.alloc(x.d, @max(bytes, 256));
+         errdefer b.free();
+@@ -411,6 +454,7 @@ pub const Drafter = struct {
+         const x = try gpa.create(Drafter);
+         errdefer gpa.destroy(x);
+         x.* = .{ .gpa = gpa, .d = d, .s = s, .target = target, .tk = tk, .k = try Kernels.load(d), .eps = c.text.eps, .theta = c.mtp.?.rope_theta, .context = context, .vocab = c.text.unpadded_vocab };
++        x.ar = &x.own_stash;
+         errdefer x.deinit();
+         var ck: core.checkpoint.Checkpoint = .{ .gpa = gpa, .io = io };
+         defer ck.close();
+@@ -441,8 +485,27 @@ pub const Drafter = struct {
+         x.head = try x.fp8Of(x.target.unembed);
+     }
+ 
+-    /// A bf16 lane weight as a per-tensor FP8 lane weight (e4m3 at amax / 448), repacked on the GPU.
++    /// Frees one of this drafter's own buffers (a weight its FP8 copy replaced); a pointer it does not own (the
++    /// target's head) stays. The caller has synchronized the stream.
++    fn drop(x: *Drafter, ptr: u64) bool {
++        for (x.buffers.items, 0..) |*b, i| if (b.ptr == ptr) {
++            b.free();
++            _ = x.buffers.swapRemove(i);
++            return true;
++        };
++        return false;
++    }
++
++    /// A bf16 lane weight as a per-tensor FP8 lane weight (e4m3 at amax / 448), repacked on the GPU. The bf16 weight
++    /// is freed when it is this drafter's own (its layers': only the FP8 lanes are read after; the target's head stays).
+     fn fp8Of(x: *Drafter, u: Lane) !Lane {
++        const out = try x.fp8Copy(u);
++        try x.s.synchronize();
++        if (x.drop(u.codes)) x.weight_bytes -|= @as(usize, u.npad) * u.k * 2;
++        return out;
++    }
++
++    fn fp8Copy(x: *Drafter, u: Lane) !Lane {
+         const total: usize = @as(usize, u.npad) * u.k;
+         const amax = try x.alloc(4);
+         try x.d.check(x.d.api.cuMemsetD8Async(amax, 0, 4, x.s.handle), "cuMemsetD8Async");
+@@ -454,6 +517,7 @@ pub const Drafter = struct {
+         try x.s.synchronize();
+         var bits: u32 = 0;
+         try cuda.memory.download(x.d, amax, std.mem.asBytes(&bits));
++        _ = x.drop(amax);
+         const m: f32 = @bitCast(bits);
+         if (!(m > 0) or !std.math.isFinite(m)) return error.DSparkHeadRange;
+         const scale = m / 448.0;
+@@ -480,6 +544,12 @@ pub const Drafter = struct {
+         for ([_]u64{ x.phi, x.phi8, x.phi_scales }) |v| a.add(v);
+         a.add(@as(i32, @intCast(V)));
+         try go(x.k.phi8, x.s, .{ .x = @intCast((V + 7) / 8) }, 256, &a);
++        // the walk reads phi8 from here on (vocabStep): the bf16 phi is dead
++        try x.s.synchronize();
++        if (x.drop(x.phi)) {
++            x.weight_bytes -|= V * rank * 2;
++            x.phi = 0;
++        }
+     }
+ 
+     /// One walk step's folded logits for `n` streams: base rows `base_stride` apart, latents [n][R], out rows V apart.
+@@ -599,8 +669,8 @@ pub const Drafter = struct {
+         x.logits = try x.alloc(max_batch * V * 4);
+         x.raw = try x.alloc(max_batch * 3 * rank * 4);
+         x.picks = try x.alloc(max_batch * pickParts(V) * 8);
+-        x.stash_cap = if (keepOn()) stashBytes() else 0;
+-        if (x.stash_cap > 0) x.stash = try x.alloc(x.stash_cap);
++        const room = if (keepOn()) stash.bytesFromEnv() else 0;
++        if (room > 0) x.own_stash = .{ .base = try x.alloc(room), .cap = room };
+         x.po = try x.alloc(x.chunks * block * heads * head_dim * 4);
+         x.pml = try x.alloc(x.chunks * block * heads * 2 * 4);
+         var part: usize = 0;
+@@ -651,10 +721,12 @@ pub const Drafter = struct {
+     }
+ 
+     pub fn deinit(x: *Drafter) void {
++        if (x.pg) |p| p.deinit();
+         x.lanes.deinit(x.gpa);
+         for (x.slots.items) |*sl| sl.kept.deinit(x.gpa);
+         for (x.stashed.items) |*e| e.tokens.deinit(x.gpa);
+         x.stashed.deinit(x.gpa);
++        x.own_stash.deinit(x.gpa);
+         for (x.slot_bufs.items) |*b| b.free();
+         x.slot_bufs.deinit(x.gpa);
+         x.slots.deinit(x.gpa);
+@@ -671,11 +743,41 @@ pub const Drafter = struct {
+         return n;
+     }
+ 
+-    /// `streams` slots' caches, allocated now (the host's count); a smaller count than held keeps them.
++    /// The global ring on leased pages (the family charges them per token, TF_INKLING2_DRAFT_PAGES): set before the
++    /// slots are reserved, on the device the target's pages are on. `lease_rows`: the ledger's lease quantum (a
++    /// request's rows are leased in whole target pages of that many tokens), the step its rows are mapped in.
++    pub fn pageGlobal(x: *Drafter, device: cuda.abi.Device, lease_rows: usize) void {
++        x.page_device = device;
++        x.lease_rows = @max(1, lease_rows);
++    }
++
++    /// A stream's device bytes at load (laneBytes).
++    pub fn streamBytes(x: *const Drafter) usize {
++        return laneBytes(x.context, x.page_device != null);
++    }
++
++    /// `streams` slots' caches, allocated now (the host's count); a smaller count than held keeps them. With paged
++    /// global rings the first call opens their pages for that many slots; a slot past them is refused.
+     pub fn reserve(x: *Drafter, streams: u32) !void {
++        if (x.page_device) |dev| if (x.pg == null and streams > 0) {
++            const p = try mini_pages.Pages.open(x.gpa, x.d, dev, 1, streams, 1, pagedRing(x.context) * page_rows);
++            p.keep = 0; // a stream's pages all go back when it ends (its context lives on in the stash)
++            p.pool_limit = 0; // freed, not pooled: only leased pages stay allocated
++            p.label = "DSpark global ring"; // TF_INKLING2_PAGES_TRACE=1: its own line beside the target's
++            x.pg = p;
++        };
+         while (x.slots.items.len < streams) {
+-            var sl: Slot = .{ .k = undefined, .v = undefined, .rings = .{ local_ring, globalRing(x.context), local_ring }, .newest = 0, .walk = 0 };
++            const paged = if (x.pg) |p| x.slots.items.len < p.g.slots else false;
++            if (x.pg != null and !paged) return error.Inkling2PageRange;
++            var sl: Slot = .{ .k = undefined, .v = undefined, .rings = .{ local_ring, if (paged) pagedRing(x.context) else globalRing(x.context), local_ring }, .newest = 0, .walk = 0 };
+             for (0..3) |i| {
++                if (i == 1 and paged) {
++                    const p = x.pg.?;
++                    const plane = p.g.pagesPerPlane() * p.g.page_bytes;
++                    sl.k[i] = p.base(0, 0) + x.slots.items.len * plane;
++                    sl.v[i] = p.base(0, 1) + x.slots.items.len * plane;
++                    continue;
++                }
+                 const bytes = sl.rings[i] * kv_width * 2;
+                 sl.k[i] = try x.slotAlloc(bytes);
+                 sl.v[i] = try x.slotAlloc(bytes);
+@@ -686,6 +788,21 @@ pub const Drafter = struct {
+         }
+     }
+ 
++    /// Global rows [start, end) of slot `slot` are about to be written: their pages become the slot's own, through
++    /// the end of the lease quantum `end` falls in. Mapping a page synchronizes the stream (Pages.ensure: it waits out
++    /// the target's queued work); a quantum at a time does that once a lease step (8,192 rows) instead of once a
++    /// 1,024-row page. The ledger leases a request min(prompt + max tokens, context) + verify_rows (>= block, the
++    /// furthest a hold writes) rounded up to the quantum, so every row mapped here is already leased.
++    fn ensureGlobal(x: *Drafter, slot: usize, start: u64, end: u64) !void {
++        const p = x.pg orelse return;
++        if (start >= end) return;
++        try p.ensure(x.s, slot, @intCast(start * page_rows), @intCast(mappedEnd(x.context, x.lease_rows, end) * page_rows));
++    }
++
++    fn slotIndex(x: *const Drafter, sl: *const Slot) usize {
++        return (@intFromPtr(sl) - @intFromPtr(x.slots.items.ptr)) / @sizeOf(Slot);
++    }
++
+     fn slotAlloc(x: *Drafter, bytes: usize) !u64 {
+         var b = try DeviceBuffer.alloc(x.d, bytes);
+         errdefer b.free();
+@@ -709,7 +826,7 @@ pub const Drafter = struct {
+         const x = self(ptr);
+         const fp8 = fp8HeadOn();
+         const costs: []const HoldCost = if (!costsOn()) &.{} else if (batchOn()) (if (fp8) &batched_costs8 else &batched_costs) else (if (fp8) &serial_costs8 else &serial_costs);
+-        return .{ .depth = depth, .step_ms = 0, .fixed_block = true, .plain_guard = true, .batched = batchOn(), .stream_bytes = laneBytes(x.context), .hold_costs = costs };
++        return .{ .depth = depth, .step_ms = 0, .fixed_block = true, .plain_guard = true, .batched = batchOn(), .stream_bytes = x.streamBytes(), .hold_costs = costs };
+     }
+ 
+     fn openFn(ptr: *anyopaque, s: *Stream) anyerror!void {
+@@ -742,6 +859,9 @@ pub const Drafter = struct {
+         const x = self(ptr);
+         const e = x.lanes.fetchRemove(s) orelse return;
+         const sl = &x.slots.items[e.value.slot];
++        // paged: the global rows go back as the release ends, after the stash's copy (queued first; releaseSlot
++        // synchronizes before it unmaps)
++        defer if (x.pg) |p| p.releaseSlot(x.s, e.value.slot, 0) catch |err| std.log.warn("Inkling 2 Mini DSpark: global pages of slot {d} not released ({s})", .{ e.value.slot, @errorName(err) });
+         sl.used = false;
+         x.releases += 1;
+         sl.released = x.releases;
+@@ -750,6 +870,12 @@ pub const Drafter = struct {
+         sl.kept_end = 0;
+         const l = e.value;
+         if (!keepOn() or s.images.len > 0 or l.end <= l.from or s.context.items.len < l.end) return;
++        if (x.pg != null) {
++            // paged: the slot's global rows go back as the release ends, so it keeps no context (resumeFrom); the
++            // stash holds it
++            if (keptFrom(l.from, l.end) + keep_min <= l.end) x.stashSlot(sl, s.context.items[0..@intCast(l.end)], l.from, l.end) catch {};
++            return;
++        }
+         sl.kept.appendSlice(x.gpa, s.context.items[0..@intCast(l.end)]) catch return; // no room: nothing kept
+         sl.kept_from = l.from;
+         sl.kept_end = l.end;
+@@ -765,28 +891,29 @@ pub const Drafter = struct {
+     /// global rows a resume can attend are kept, [keptFrom(from, end), end) like the sliding rings' (at most
+     /// local_ring - block rows): a stashed context is ~13.5 MiB at most, whatever the prompt's length.
+     fn stashSlot(x: *Drafter, sl: *const Slot, tokens: []const u32, absorbed: u64, end: u64) !void {
+-        if (x.stash_cap == 0 or end <= absorbed) return;
++        if (!x.ar.on() or end <= absorbed) return;
+         const from = keptFrom(absorbed, end);
+         const size = stashSize(from, end);
+-        if (size > x.stash_cap) return;
+-        if (x.stash_at + size > x.stash_cap) x.stash_at = 0;
+-        const lo = x.stash_at;
+-        const hi = lo + size;
++        if (size > x.ar.cap) return;
++        // entries this context supersedes give their room back; then its room (a ring: the entries it overlaps, this
++        // drafter's or the combined drafter's other's, are dropped)
+         var i: usize = 0;
+         while (i < x.stashed.items.len) {
+             const e = &x.stashed.items[i];
+-            const over = e.off < hi and lo < e.off + e.bytes;
+-            const older = supersedes(e.from, e.end, e.tokens.items, from, end, tokens);
+-            if (over or older) {
++            if (supersedes(e.from, e.end, e.tokens.items, from, end, tokens)) {
++                x.ar.drop(e.id);
+                 e.tokens.deinit(x.gpa);
+                 _ = x.stashed.swapRemove(i);
+             } else i += 1;
+         }
+-        var e: Stashed = .{ .from = from, .end = end, .off = lo, .bytes = size, .order = x.releases };
++        const sp = (try x.ar.take(x.gpa, size)) orelse return;
++        errdefer x.ar.drop(sp.id);
++        x.pruneStash();
++        var e: Stashed = .{ .from = from, .end = end, .off = sp.off, .bytes = size, .order = x.releases, .id = sp.id };
+         try e.tokens.appendSlice(x.gpa, tokens);
+         errdefer e.tokens.deinit(x.gpa);
+         const rb = ringBytes();
+-        var at = x.stash + lo;
++        var at = x.ar.base + sp.off;
+         for ([_]usize{ 0, 2 }) |li| {
+             try x.dtod(at, sl.k[li], rb);
+             at += rb;
+@@ -798,27 +925,16 @@ pub const Drafter = struct {
+         try x.dtod(at, sl.k[1] + g0, gb);
+         try x.dtod(at + gb, sl.v[1] + g0, gb);
+         try x.stashed.append(x.gpa, e);
+-        x.stash_at = hi;
+     }
+ 
+     /// The newest stashed context holding tokens [0, start) of `s`, copied into `sl`: the first row it gives back;
+     /// null: none matches (the stream starts at `start`).
+     fn unstash(x: *Drafter, s: *const Stream, sl: *const Slot, start: u64) !?u64 {
+-        if (x.stash_cap == 0 or s.images.len > 0) return null;
+-        const n: usize = @intCast(start);
+-        if (s.context.items.len < n) return null;
+-        var best: ?usize = null;
+-        for (x.stashed.items, 0..) |e, i| {
+-            if (start > e.end or e.tokens.items.len < n) continue;
+-            if (keptFrom(e.from, e.end) + keep_min > start) continue;
+-            if (best != null and e.order <= x.stashed.items[best.?].order) continue;
+-            if (!std.mem.eql(u32, e.tokens.items[0..n], s.context.items[0..n])) continue;
+-            best = i;
+-        }
+-        const e = x.stashed.items[best orelse return null];
++        const e = x.stashed.items[x.stashFor(s, start) orelse return null];
+         const from = keptFrom(e.from, e.end);
++        try x.ensureGlobal(x.slotIndex(sl), from, start);
+         const rb = ringBytes();
+-        var at = x.stash + e.off;
++        var at = x.ar.base + e.off;
+         for ([_]usize{ 0, 2 }) |li| {
+             try x.dtod(sl.k[li], at, rb);
+             at += rb;
+@@ -834,11 +950,39 @@ pub const Drafter = struct {
+         return from;
+     }
+ 
++    /// Whether a prompt resumed at `start` (s.cached: rows the target restored from its prompt cache) finds its
++    /// drafting context here, in a free slot's kept context or the stash (the combined drafter routes by it).
++    pub fn holdsContext(x: *const Drafter, s: *const Stream, start: u64) bool {
++        if (start == 0) return false;
++        for (x.slots.items) |*sl| {
++            if (!sl.used and x.resumeFrom(s, sl, start) != null) return true;
++        }
++        return x.stashFor(s, start) != null;
++    }
++
++    /// The newest live stash entry holding tokens [0, start) of `s` with at least keep_min rows to give.
++    fn stashFor(x: *const Drafter, s: *const Stream, start: u64) ?usize {
++        if (!x.ar.on() or s.images.len > 0) return null;
++        const n: usize = @intCast(start);
++        if (s.context.items.len < n) return null;
++        var best: ?usize = null;
++        for (x.stashed.items, 0..) |e, i| {
++            if (start > e.end or e.tokens.items.len < n) continue;
++            if (keptFrom(e.from, e.end) + keep_min > start) continue;
++            if (best != null and e.order <= x.stashed.items[best.?].order) continue;
++            if (!x.ar.holds(e.id)) continue;
++            if (!std.mem.eql(u32, e.tokens.items[0..n], s.context.items[0..n])) continue;
++            best = i;
++        }
++        return best;
++    }
++
+     /// The first row a stream resumed at `start` (its prompt restored from the target's cache) can attend in its
+     /// slot's kept context: tokens [0, start) must be the kept stream's, and the sliding rings still hold the kept
+     /// stream's last local_ring - block rows (its last hold wrote a block past its end); null: start cold.
+     fn resumeFrom(x: *const Drafter, s: *const Stream, sl: *const Slot, start: u64) ?u64 {
+-        _ = x;
++        // paged: a released slot's global rows went back with its pages (the stash holds the context)
++        if (x.pg != null) return null;
+         if (!keepOn() or s.images.len > 0 or sl.kept_end == 0 or start > sl.kept_end) return null;
+         const n: usize = @intCast(start);
+         if (s.context.items.len < n or sl.kept.items.len < n) return null;
+@@ -913,6 +1057,9 @@ pub const Drafter = struct {
+                     if (resumeTrace()) std.log.info("Inkling 2 Mini DSpark: resumed at {d} from the {s}, attending rows {d}..{d}; resumes slot {d}, stash {d}, cold {d}; stash {d} entries, {d} MiB", .{ item.start, @tagName(how), l.from, item.start, x.resumes[0], x.resumes[1], x.resumes[2], x.stashed.items.len, x.stashBytesHeld() >> 20 });
+                 }
+             }
++            // a prompt's chunk maps through the prompt's end (leased whole): one synchronize a prompt, not one a chunk
++            const upto = if (item.prompt) @max(item.start + f.rows, @min(@as(u64, item.stream.prompt_len), x.context)) else item.start + f.rows;
++            try x.ensureGlobal(l.slot, item.start, upto);
+             var done: usize = 0;
+             while (done < f.rows) {
+                 const n = @min(absorb_rows, f.rows - done);
+@@ -1095,6 +1242,7 @@ pub const Drafter = struct {
+             if (anchor + block > x.context + block) return error.DraftContextGap;
+             const n: usize = @min(item.depth, depth);
+             const sl = &x.slots.items[l.slot];
++            try x.ensureGlobal(l.slot, anchor, anchor + block);
+             const pending = [1]i32{@intCast(item.pending)};
+             try cuda.copy_source.enqueue(x.d, sl.walk, std.mem.sliceAsBytes(&pending), x.s);
+             try x.encodeBlock(sl, l, anchor);
+@@ -1121,6 +1269,7 @@ fn holdBatchImpl(x: *Drafter, items: []const dr.Hold) !void {
+         if (l.end != anchor) return error.DraftContextGap;
+         if (anchor + block > x.context + block) return error.DraftContextGap;
+         const sl = &x.slots.items[l.slot];
++        try x.ensureGlobal(l.slot, anchor, anchor + block);
+         const pending = [1]i32{@intCast(item.pending)};
+         try cuda.copy_source.enqueue(x.d, sl.walk, std.mem.sliceAsBytes(&pending), x.s);
+         bi[b] = .{ .l = l, .sl = sl, .anchor = anchor, .n = @min(item.depth, depth) };
+@@ -1264,10 +1413,34 @@ fn admit(c: *const config.Config) !void {
+ test "rings hold a block past the window, and a stream's bytes count all three layers" {
+     try std.testing.expectEqual(@as(usize, 1152), local_ring);
+     try std.testing.expectEqual(@as(usize, 32896), globalRing(32768));
+-    try std.testing.expectEqual(2 * 2 * 1152 * 1024 * 2 + 2 * 32896 * 1024 * 2 + 2304 * 2 + 256, laneBytes(32768));
++    try std.testing.expectEqual(2 * 2 * 1152 * 1024 * 2 + 2 * 32896 * 1024 * 2 + 2304 * 2 + 256, laneBytes(32768, false));
++    try std.testing.expectEqual(2 * 2 * 1152 * 1024 * 2 + (4 << 20) + 2304 * 2 + 256, laneBytes(262144, true));
++    // a paged ring is whole 4 MiB pages and holds a block past the window; a token's K and V rows are 4 KiB
++    try std.testing.expectEqual(@as(usize, 264192), pagedRing(262144));
++    try std.testing.expectEqual(@as(usize, 0), pagedRing(262144) * kv_width * 2 % (4 << 20));
++    try std.testing.expectEqual(@as(usize, 4096), page_token_bytes);
++    try std.testing.expectEqual(@as(usize, 8), page_rows);
+     try std.testing.expectEqual(@as(usize, 4 * 2304 * 2), row_bytes);
+ }
+ 
++test "a paged DSpark ring maps whole lease quanta, never past the ledger's lease or the ring" {
++    const t = std.testing;
++    const ctx: usize = 262144;
++    try t.expectEqual(@as(u64, 8192), mappedEnd(ctx, 8192, 1));
++    try t.expectEqual(@as(u64, 8192), mappedEnd(ctx, 8192, 8192));
++    try t.expectEqual(@as(u64, 16384), mappedEnd(ctx, 8192, 8193));
++    try t.expectEqual(@as(u64, pagedRing(ctx)), mappedEnd(ctx, 8192, ctx + block)); // a hold at the window's end
++    try t.expectEqual(@as(u64, 1000), mappedEnd(ctx, 1, 1000));
++    // cuda_ledger.Cost.of: alignForward(min(prompt + max_tokens, context) + verify_rows (8), 8192) rows leased; the
++    // furthest row written is a hold's block past the last committed token (or the window's end)
++    var used: u64 = 1;
++    while (used <= ctx) : (used += 997) {
++        const leased = std.mem.alignForward(u64, used + 8, 8192);
++        try t.expect(mappedEnd(ctx, 8192, used + block) <= leased);
++        try t.expect(mappedEnd(ctx, 8192, used) * page_rows <= pagedRing(ctx) * page_rows);
++    }
++}
++
+ test "a stash entry is superseded only by one that still holds every row it gives" {
+     var toks: [1700]u32 = undefined;
+     for (&toks, 0..) |*t, i| t.* = @intCast(i);
+diff --git a/zig/src/families/inkling2/mini_native.zig b/zig/src/families/inkling2/mini_native.zig
+index c8c7222..8222a26 100644
+--- a/zig/src/families/inkling2/mini_native.zig
++++ b/zig/src/families/inkling2/mini_native.zig
+@@ -53,7 +53,9 @@ fn sharedKvOn() bool {
+     return v[0] == '1';
+ }
+ 
+-const Owned = struct { gpa: std.mem.Allocator, w: wts.Weights, k: mm.Kernels, x: be.Draws, s: cuda.Stream, m: mm.Model, b: be.Mini, v: ?*mini_vision.Images = null };
++/// `draft_pages`: the ledger's token cost includes a DSpark global ring's rows (TF_INKLING2_DRAFT_PAGES=1 with shared
++/// KV), so a DSpark drafter opened on this model pages its global ring (dspark.pageGlobal).
++const Owned = struct { gpa: std.mem.Allocator, w: wts.Weights, k: mm.Kernels, x: be.Draws, s: cuda.Stream, m: mm.Model, b: be.Mini, v: ?*mini_vision.Images = null, draft_pages: bool = false };
+ 
+ /// Streams to allocate in `room`: as asked, else (auto) the most that fit; a fixed count past them refuses.
+ fn fit(room: u64, asked: u32, fixed: bool, plan: anytype) !usize {
+@@ -124,6 +126,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+     own.b.vision = own.v;
+     if (own.v) |vis| std.log.info("Inkling 2 Mini vision: {d} layers, {d:.2} GiB weights, up to {d} image tokens / {d} images", .{ vis.c.layers, gib(vis.w.bytes), vis.limits.image_tokens, vis.limits.max_images });
+     if (own.m.pages) |p| std.log.info("Inkling 2 Mini shared KV: whole caches on {d} MiB pages, {d} positions a page, {d:.2} GiB a full window, leased per request", .{ p.g.page_bytes >> 20, p.g.rowsPerPage(), gib(p.g.bytesAt(context)) });
++    own.draft_pages = own.m.pages != null and dspark.pagesOn();
++    if (own.draft_pages) std.log.info("Inkling 2 Mini shared KV: a DSpark drafter's global ring on pages too, {d} bytes a token leased with the target's ({d:.2} GiB more a full window)", .{ dspark.page_token_bytes, gib(dspark.page_token_bytes * context) });
+     std.log.info("Inkling 2 Mini: {d} visits a token ({d} sliding, {d} full, {d} conv slots a stream), {d} streams of {d} positions ({s} caches), {d:.2} GiB of weights", .{ own.w.plan.visits.len, own.w.plan.visits.count(.sliding), own.w.plan.visits.count(.full), own.w.plan.visits.count(.conv), n, context, if (o.kv8) "fp8" else "bf16", gib(own.w.bytes) });
+     return .{
+         .backend = own.b.backend(),
+@@ -138,7 +142,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+         .shared_pages = if (own.m.pages) |p| .{
+             .fixed_bytes = 0, // every stream's own state is allocated already
+             .scratch = (1 + mini_pages.pool_cap + p.g.slots * p.g.slotPlanes() * p.keep) * p.g.page_bytes, // zero page, pool, kept slot pages
+-            .token_bytes = p.g.bytesAt(1) / p.g.rowsPerPage(),
++            .token_bytes = p.g.bytesAt(1) / p.g.rowsPerPage() + (if (own.draft_pages) @as(usize, dspark.page_token_bytes) else 0),
+             .page_tokens = @intCast(p.g.rowsPerPage()),
+             .lookahead = be.verify_rows,
+         } else null,
+@@ -159,7 +163,8 @@ pub fn openDrafter(gpa: std.mem.Allocator, io: std.Io, p: *anyopaque, dir: []con
+     }
+     own.m.drafter_window = null;
+     const d = try dspark.Drafter.init(gpa, io, own.m.d, own.s, &own.w, &own.k, own.m.context, dir);
+-    std.log.info("Inkling 2 Mini DSpark: {d} drafts a block from {s}, bf16 weights (--drafter-bits {d} serves bf16), {d:.2} GiB fixed, {d:.2} GiB a stream", .{ dspark.depth, dir, bits, gib(d.fixedBytes()), gib(dspark.laneBytes(own.m.context)) });
++    if (own.draft_pages) d.pageGlobal(own.m.device, own.m.pages.?.g.rowsPerPage());
++    std.log.info("Inkling 2 Mini DSpark: {d} drafts a block from {s}, bf16 weights (--drafter-bits {d} serves bf16), {d:.2} GiB fixed, {d:.2} GiB a stream{s}", .{ dspark.depth, dir, bits, gib(d.fixedBytes()), gib(d.streamBytes()), if (own.draft_pages) " (its global ring on leased pages)" else "" });
+     return .{ .drafter = d.drafter(), .ctx = d, .close = closeDrafter, .reserve = reserveDrafter };
+ }
+ 
+diff --git a/zig/src/families/inkling2/mini_pages.zig b/zig/src/families/inkling2/mini_pages.zig
+index 32978bb..8a91426 100644
+--- a/zig/src/families/inkling2/mini_pages.zig
++++ b/zig/src/families/inkling2/mini_pages.zig
+@@ -149,11 +149,16 @@ pub const Pages = struct {
+     /// Pages a plane each slot keeps between its prompts (TF_INKLING2_SLOT_PAGES, default 1: its first 8,192 positions),
+     /// charged to the ledger's scratch; a short prompt then maps nothing.
+     keep: usize = 1,
++    /// Released physical pages kept for reuse at most (pool_cap; the drafter's pages keep none: freed at release, so
++    /// nothing outside the ledger's leases stays allocated).
++    pool_limit: usize = pool_cap,
+     /// TF_INKLING2_SNAP_SHARE_PARTIAL=1 (dev: to exercise copy on write): snapshots hold the partly filled last page too
+     /// instead of copying its rows, so a restored slot's first write copies that page.
+     share_partial: bool = false,
+     trace: bool = false,
+-    stats: struct { ns: [3]u64 = @splat(0), calls: [3]u64 = @splat(0), fresh: u64 = 0, copies: u64 = 0, released: u64 = 0 } = .{},
++    /// The trace's name for these pages ("KV": the target's caches; the DSpark drafter names its global ring).
++    label: []const u8 = "KV",
++    stats: struct { ns: [3]u64 = @splat(0), calls: [3]u64 = @splat(0), fresh: u64 = 0, copies: u64 = 0, released: u64 = 0, drains: u64 = 0 } = .{},
+ 
+     /// Reserve every plane's addresses and map the zero page under each of its pages.
+     pub fn open(a: A, d: *const cuda.Driver, device: cuda.abi.Device, visits: usize, slots: usize, heads: usize, ring: usize) !*Pages {
+@@ -239,7 +244,7 @@ pub const Pages = struct {
+     /// A released physical page: kept in the pool while it has room, else given back to the driver.
+     fn recycle(p: *Pages, handle: u64) void {
+         p.lockPool();
+-        if (p.pooled < pool_cap) {
++        if (p.pooled < p.pool_limit) {
+             p.pool[p.pooled] = handle;
+             p.pooled += 1;
+             p.unlockPool();
+@@ -331,6 +336,7 @@ pub const Pages = struct {
+                 if (!drained) {
+                     try s.synchronize(); // nothing may still read a page being replaced
+                     drained = true;
++                    p.stats.drains += 1;
+                 }
+                 due[n_due] = i;
+                 n_due += 1;
+@@ -395,8 +401,8 @@ pub const Pages = struct {
+         const k = @intFromEnum(kind);
+         p.stats.ns[k] += clockNs() - t0;
+         p.stats.calls[k] += 1;
+-        if (kind == .release and p.stats.calls[k] % 64 == 0) std.log.info("Inkling KV pages: ensure {d} calls {d:.1} ms, release {d} calls {d:.1} ms, restore {d} calls {d:.1} ms; pages made {d}, copied {d}, released {d}", .{
+-            p.stats.calls[0], @as(f64, @floatFromInt(p.stats.ns[0])) / 1e6, p.stats.calls[1], @as(f64, @floatFromInt(p.stats.ns[1])) / 1e6, p.stats.calls[2], @as(f64, @floatFromInt(p.stats.ns[2])) / 1e6, p.stats.fresh, p.stats.copies, p.stats.released,
++        if (kind == .release and p.stats.calls[k] % 64 == 0) std.log.info("Inkling {s} pages: ensure {d} calls {d:.1} ms, release {d} calls {d:.1} ms, restore {d} calls {d:.1} ms; pages made {d}, copied {d}, released {d}; ensure synchronized {d} times", .{
++            p.label, p.stats.calls[0], @as(f64, @floatFromInt(p.stats.ns[0])) / 1e6, p.stats.calls[1], @as(f64, @floatFromInt(p.stats.ns[1])) / 1e6, p.stats.calls[2], @as(f64, @floatFromInt(p.stats.ns[2])) / 1e6, p.stats.fresh, p.stats.copies, p.stats.released, p.stats.drains,
+         });
+     }
+ 
+@@ -629,6 +635,43 @@ test "shared KV pages: a failed unmap at restore keeps the slot's own page mappe
+     for (0..p.g.slotPlanes()) |j| try std.testing.expectEqual(snap.pages[j], p.mapped[p.g.pageIndex(p.g.slotPlane(1, j), 0)].?);
+ }
+ 
++test "drafter pages (keep 0, no pool, as DSpark's paged global ring): one synchronize a mapped range, everything back at release, a failed allocation leaves no hole" {
++    const t = std.testing;
++    const a = std.testing.allocator;
++    var d: cuda.Driver = undefined;
++    const p = try FakeVmm.open(a, &d);
++    defer FakeVmm.close(p);
++    p.keep = 0;
++    p.pool_limit = 0;
++    const s: cuda.Stream = .{ .d = &d, .handle = null };
++    const rows = p.g.rowsPerPage();
++    // a range of two pages a plane at once (mini_dspark.ensureGlobal maps a lease quantum): one synchronize
++    try p.ensure(s, 0, 0, rows + 1);
++    try t.expectEqual(@as(u64, 1), p.stats.drains);
++    try t.expectEqual(@as(u64, 2 * p.g.slotPlanes()), p.stats.fresh);
++    // rows inside pages already the slot's own: nothing to map, no synchronize
++    try p.ensure(s, 0, 5, 2 * rows);
++    try t.expectEqual(@as(u64, 1), p.stats.drains);
++    try FakeVmm.consistent(p);
++    try p.releaseSlot(s, 0, 0);
++    try FakeVmm.consistent(p);
++    try t.expectEqual(@as(usize, 0), p.pooled);
++    var live: usize = 0;
++    for (FakeVmm.live) |l| live += @intFromBool(l);
++    try t.expectEqual(@as(usize, 1), live); // the zero page only: every leased page went back to the driver
++    // out of memory while mapping: the error comes back, every address still maps a page, and a release frees all
++    FakeVmm.fail_create = true;
++    try t.expectError(error.NotReady, p.ensure(s, 1, 0, 2 * rows));
++    FakeVmm.fail_create = false;
++    try FakeVmm.consistent(p);
++    try p.ensure(s, 1, 0, 1);
++    try p.releaseSlot(s, 1, 0);
++    try FakeVmm.consistent(p);
++    live = 0;
++    for (FakeVmm.live) |l| live += @intFromBool(l);
++    try t.expectEqual(@as(usize, 1), live);
++}
++
+ test "shared KV pages: copy on write gives the writer a copy and leaves the snapshot its page" {
+     const a = std.testing.allocator;
+     var d: cuda.Driver = undefined;
+diff --git a/zig/src/families/inkling2/mini_stash.zig b/zig/src/families/inkling2/mini_stash.zig
+new file mode 100644
+index 0000000..875dcc1
+--- /dev/null
++++ b/zig/src/families/inkling2/mini_stash.zig
+@@ -0,0 +1,99 @@
++//! The drafters' stash: device room (TF_INKLING2_DRAFT_STASH_MIB, allocated at load so the stream budget counts it)
++//! for released streams' drafting contexts, so a prompt resumed from the target's prompt cache finds its context after
++//! its slot was reused. One stash serves the combined drafter's two (DFlash 2 and DSpark): entries go round a ring, a
++//! new one drops the entries whose room it takes, whichever drafter stashed them; each drafter keeps its own index
++//! (tokens, rows) and asks the stash whether an entry's room still holds it.
++const std = @import("std");
++
++/// TF_INKLING2_DRAFT_STASH_MIB: the stash's device MiB (default 512: ~38 DSpark contexts at their ~13.5 MiB most, or
++/// ~70 DFlash 2 contexts of 1.5K tokens at 4.6 KB a row); 0: none, only a still-free slot's context.
++pub fn bytesFromEnv() usize {
++    const v = std.c.getenv("TF_INKLING2_DRAFT_STASH_MIB") orelse return default_mib << 20;
++    const n = std.fmt.parseInt(usize, std.mem.trim(u8, std.mem.span(v), " \t\r\n"), 10) catch return default_mib << 20;
++    return n << 20;
++}
++pub const default_mib = 512;
++
++/// An entry's room: `bytes` at `off` from the stash's base, `id` while it holds them.
++pub const Span = struct { off: usize, bytes: usize, id: u64 };
++
++pub const Arena = struct {
++    base: u64 = 0, // device address (0: no stash)
++    cap: usize = 0,
++    at: usize = 0, // where the next entry goes
++    next: u64 = 1,
++    live: std.ArrayList(Span) = .empty,
++
++    pub fn deinit(a: *Arena, gpa: std.mem.Allocator) void {
++        a.live.deinit(gpa);
++    }
++
++    pub fn on(a: *const Arena) bool {
++        return a.cap > 0;
++    }
++
++    /// Room for `bytes` at the ring's next place; the entries it overlaps are dropped. null: no stash, or larger than it.
++    pub fn take(a: *Arena, gpa: std.mem.Allocator, bytes: usize) !?Span {
++        if (bytes == 0 or bytes > a.cap) return null;
++        try a.live.ensureUnusedCapacity(gpa, 1);
++        if (a.at + bytes > a.cap) a.at = 0;
++        const off = a.at;
++        var i: usize = 0;
++        while (i < a.live.items.len) {
++            const e = a.live.items[i];
++            if (e.off < off + bytes and off < e.off + e.bytes) {
++                _ = a.live.swapRemove(i);
++            } else i += 1;
++        }
++        const sp: Span = .{ .off = off, .bytes = bytes, .id = a.next };
++        a.live.appendAssumeCapacity(sp);
++        a.next += 1;
++        a.at = off + bytes;
++        return sp;
++    }
++
++    /// Whether entry `id`'s room still holds it.
++    pub fn holds(a: *const Arena, id: u64) bool {
++        for (a.live.items) |e| if (e.id == id) return true;
++        return false;
++    }
++
++    /// Entry `id` gives its room back (a drafter dropped it).
++    pub fn drop(a: *Arena, id: u64) void {
++        for (a.live.items, 0..) |e, i| if (e.id == id) {
++            _ = a.live.swapRemove(i);
++            return;
++        };
++    }
++
++    pub fn heldBytes(a: *const Arena) usize {
++        var n: usize = 0;
++        for (a.live.items) |e| n += e.bytes;
++        return n;
++    }
++};
++
++test "the stash is a ring: a new entry drops the ones whose room it takes, whoever stashed them" {
++    const gpa = std.testing.allocator;
++    var a: Arena = .{ .base = 1 << 20, .cap = 100 };
++    defer a.deinit(gpa);
++    const e1 = (try a.take(gpa, 40)).?;
++    const e2 = (try a.take(gpa, 40)).?;
++    try std.testing.expectEqual(@as(usize, 0), e1.off);
++    try std.testing.expectEqual(@as(usize, 40), e2.off);
++    try std.testing.expect(a.holds(e1.id) and a.holds(e2.id));
++    // 30 more do not fit past 80: back to 0, over e1 only
++    const e3 = (try a.take(gpa, 30)).?;
++    try std.testing.expectEqual(@as(usize, 0), e3.off);
++    try std.testing.expect(!a.holds(e1.id) and a.holds(e2.id) and a.holds(e3.id));
++    // 20 at 30..50 overlaps e2 (40..80)
++    const e4 = (try a.take(gpa, 20)).?;
++    try std.testing.expect(!a.holds(e2.id) and a.holds(e3.id) and a.holds(e4.id));
++    try std.testing.expectEqual(@as(usize, 50), a.heldBytes());
++    a.drop(e3.id);
++    try std.testing.expect(!a.holds(e3.id));
++    try std.testing.expectEqual(@as(?Span, null), try a.take(gpa, 101));
++    var none: Arena = .{};
++    try std.testing.expectEqual(@as(?Span, null), try none.take(gpa, 1));
++    try std.testing.expect(!none.on());
++}

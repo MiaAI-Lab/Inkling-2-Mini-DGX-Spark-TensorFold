@@ -14,7 +14,7 @@
 Serve **[Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)** on a single **NVIDIA DGX Spark** (GB10, `sm_121`, 128 GB
 unified memory) through an OpenAI-compatible API (plus a `/v1/messages` Messages-format endpoint). It runs [TensorFold](https://github.com/ashhart/TensorFold)'s Zig engine
 (`tensorfold-native`, Jürgen Schmied's Inkling 2 Mini CUDA engine at [PR #4441](https://github.com/ashhart/TensorFold/pull/4441), commit
-`dc2ca8a1`) plus `patches/0001`–`0030` in NVIDIA's PyTorch container. It has native CUDA vision (`inkling2_vision`: PNG, JPEG, WebP) and
+`dc2ca8a1`) plus `patches/0001`–`0040` in NVIDIA's PyTorch container. It has native CUDA vision (`inkling2_vision`: PNG, JPEG, WebP) and
 structured output and tool calling (`libtfgrammar.so`).
 
 - **Model:** a looped mixture of experts.
@@ -137,6 +137,23 @@ Prefill doesn't depend on the drafter.
 - **Vision** (live image, `VISION=1`): **PASS**. Three PNGs drafted equal `"draft": false`, and 4 requests at once equal serial ones.
 - Startup smoke test and the Derisked readiness check: **PASS**.
 
+**Patches `0001`–`0040`** (the image `scripts/prepare.sh` built from them), exact settings (`KV_DTYPE=bf16`,
+`TF_INKLING2_ATTN_FP8=0`, `TF_INKLING2_PREFILL_TC=0`, `TF_INKLING2_ATTN_FP8_TC=0`), `PARALLEL=8`:
+
+- **Default drafter (DFlash2), `CONTEXT=131072`:** `tools/exact.py` **PASS** at pads 0 and 3k (700 / 698 drafts accepted);
+  `logprobs` on completions (`logprobs: 5`) and chat (`top_logprobs: 3`) **PASS**; `tools/prompt_reuse.py` 12k × 3
+  **PASS** (98.7% resumed). With `TF_INKLING2_RESUME_TRACE=1`, every resume with at least 64 resumed rows (the 3k
+  repeats and all three follow-ups) drafted from its slot's kept DFlash2 ring (`0039`); shorter shared prefixes start cold.
+- **DFlash2 with `SHARED_KV=1`, `CONTEXT=262144`, `--prompt-cache-gib 20`:** `tools/exact.py` **PASS** at pad 3k (663 accepted);
+  logprobs **PASS**; `tools/prompt_reuse.py 12000 3 --other` **PASS**, and the three follow-ups drafted from their kept
+  DFlash2 ring although another conversation with the same system prompt ran in between (`0039`).
+- **`DRAFTER=hybrid SHARED_KV=1`, `CONTEXT=262144`, `--prompt-cache-gib 20`:** `tools/exact.py` **PASS** at pads 0 (DFlash2)
+  and 3k (DSpark) (731 / 536 drafts accepted); logprobs **PASS**; `tools/prompt_reuse.py 12000 3 --other` **PASS**, the
+  long follow-ups resumed DSpark's context from the stash (`0036`, `0038`).
+- **The defaults** (`KV_DTYPE=fp8`, `TF_INKLING2_ATTN_FP8=1`, `TF_INKLING2_PREFILL_TC=1`, `TF_INKLING2_ATTN_FP8_TC=1`, DFlash2,
+  `CONTEXT=262144`): logprobs **PASS**; greedy replies (1 and 8 at once, 512 tokens) have the same text as those of the `0001`–`0030` image,
+  at the same decode speed.
+
 **DSpark (patches `0001`–`0017`)**, the same defaults:
 
 - **`tools/exact.py`** (pads 0, 3k and 24k): **PASS**. Every prompt matches across serial drafted, `"draft": false` and 6-way concurrent replies
@@ -220,7 +237,8 @@ On a 128 GB DGX Spark with the defaults (`CONTEXT=262144`, `PARALLEL=8`, `KV_DTY
 - **`DRAFTER=dspark`:** `1.54 GiB` of drafter weights and `5.56 GiB` a stream, because DSpark's global layer keeps a bf16 K/V row for every
   position in the window. That leaves a 16.0 GiB prompt cache.
 
-Every stream reserves its full `CONTEXT` window at startup. For exact serving:
+Every stream reserves its full `CONTEXT` window at startup, unless `SHARED_KV=1` (`KV_DTYPE=bf16`): then a request leases its window's pages
+as it needs them and waits when the pool is full, which serves 8 × 262,144 bf16 windows with a 20 GiB prompt cache. For exact serving:
 - `KV_DTYPE=bf16` (with, say, `PARALLEL=4`) for bf16 KV caches;
 - `TF_INKLING2_ATTN_FP8=0` for bf16 attention projections;
 - `TF_INKLING2_PREFILL_TC=0` for bf16 prefill experts;
@@ -239,7 +257,8 @@ All defaults live in [`scripts/config.sh`](scripts/config.sh). Override them fro
 | `CONTEXT` | `262144` | prompt + reply window a stream (up to `1048576`) |
 | `KV_DTYPE` | `fp8` | target KV cache: `fp8` or `bf16` (exact) |
 | `DRAFTS` | `1` | `1`: draft with `DRAFTER`; `0`: `--no-drafts` |
-| `DRAFTER` | `dflash2` | `dflash2`: the DFlash2 draft model (`--drafter /models/draft`); `dspark`: the checkpoint's DSpark head (`--drafter /models/ink`) |
+| `DRAFTER` | `dflash2` | `dflash2`: the DFlash2 draft model (`--drafter /models/draft`); `dspark`: the checkpoint's DSpark head (`--drafter /models/ink`); `hybrid`: DFlash2 below 2,048 prompt tokens, DSpark from there (`0040`) |
+| `SHARED_KV` | `0` | `1` (with `KV_DTYPE=bf16`): caches on pages leased per request (`0037`, and DSpark's global ring with `0038`), so `PARALLEL` × `CONTEXT` may exceed memory; pass `--prompt-cache-gib` |
 | `DRAFTER_DIR` | `$HOME/models/hf/Inkling-2-Mini-DFlash2` | DFlash2 folder (auto-fetched), mounted read-only at `/models/draft` |
 | `VISION` | `1` | `1`: Inkling 2 vision tower (`--vision`, ~0.59 GiB, PNG/JPEG/WebP); `0`: text only |
 | `VISION_URLS` | `0` | `1`: also fetch http(s) image URLs (`--vision-urls`); `data:` URLs always work |
@@ -270,7 +289,7 @@ All defaults live in [`scripts/config.sh`](scripts/config.sh). Override them fro
 - **Exact serial reference:** `"draft": false` on any request turns drafting off. Drafted replies match `"draft": false` token for token.
 - **Admission:** when all `PARALLEL` slots are full, new requests are rejected rather than queued.
 
-## Patches (`patches/0001`–`0030`)
+## Patches (`patches/0001`–`0040`)
 
 Applied in order onto TensorFold `dc2ca8a1` (PR #4441) by `scripts/prepare.sh`:
 
@@ -287,6 +306,18 @@ Applied in order onto TensorFold `dc2ca8a1` (PR #4441) by `scripts/prepare.sh`:
 | `0018` | DFlash2 drafter (`mini_dflash.zig`, `inkling2/dflash.cu`): `--drafter` on a DFlash2 folder loads it in place of DSpark. Committed taps go through `fc` and the hidden norm into 5 layers' 2,048-position K/V rings; one pass embeds the pending token and 7 masks and runs the two-tap dynamic convs, non-causal block attention and SwiGLU (layers as FP8 copies); an NVFP4 copy of the target head gives each row's top 16, and a GPU candidate selector walks the path (keyed draws for sampled requests). A stream alone gives the round planner each draft's chance, the selector's probability calibrated by what landed. After TensorFold's GLM-5.3-Flash CUDA DFlash2 and [tonyd2wild](https://github.com/tonyd2wild)'s [Inkling DFlash2 patch](https://github.com/tonyd2wild/Inkling-2-Mini-NVFP4-DGX-Spark) |
 | `0019`–`0028` | Decode and prefill speedups: calibrated 64-row `shared_costs` and DFlash2 `hold_costs`; skip expired DFlash2 prompt ingest and unread last-visit prompt rows; batched DFlash2 ingest, FP8 `fc`/`kv`, graphed holds, shared ring attention and two-pass radix top-16 selector; fused activation quantization in TC MoE up epilogue; opt-in FP8 tensor-core prompt attention projections (`TF_INKLING2_ATTN_FP8_TC=1`); async raw fp8 K/V prompt attention staging with native `e4m3x2` dequant and trimmed global `grid.z`; native `e2m1x2`/`e4m3x2` decode expert unpacking; 128×128 exact FP8 prompt projections; fused decode K/V 4-tap conv + prep |
 | `0029`–`0030` | Prefill fusions and wider chunks (after [plotarmordev](https://github.com/plotarmordev)'s PR #6 and PR #7): fuse prompt loop `gate_prep` into `tf_ink2_loop_gate_down_rows`, direct 4/6-plane consumer stores from `tf_ck8_128_row_split` (eliminating `m.s.fused` staging and `tf_ink2_split_cols`), and 8,192-row prompt chunks |
+| `0031` | Test fix: `kernels_test.zig` builds the `Kernels` fixture with the fields `0005`, `0011`, `0024` and `0028` added, so `zig build test-inkling2-cuda-host` compiles again |
+| `0032` | Per-depth draft counters: each reply's `speculative.offered_by_depth` / `accepted_by_depth` and `/metrics` `tensorfold:spec_decode_num_{offered,accepted}_tokens_per_pos_total{position}` |
+| `0033` | OpenAI `logprobs` / `top_logprobs` on `/v1/completions` and chat: the first token's row and every verify row from the forward's FP32 logits (the lazy head is skipped for a logprob round), with `--drafter` too |
+| `0034` | DSpark decode kernels, exact: attention keys in up to 32 chunks a call, the vocabulary step finishing each stream on its own lane, a warp a query row |
+| `0035` | Opt-in prompt scheduling: `TENSORFOLD_PREFILL_SHORT_ROWS` (the short-prompt threshold, default 512 rows) and `TENSORFOLD_PREFILL_SHORT_BURST` (short prompts a visit) |
+| `0036` | DSpark keeps a released stream's context, and stashes released contexts (`TF_INKLING2_DRAFT_STASH_MIB`, default 512), so a prompt resumed from the prompt cache drafts warm (`TF_INKLING2_DRAFT_KEEP=0` for the old path, `TF_INKLING2_RESUME_TRACE=1` logs each resume) |
+| `0037` | Shared KV (`TF_INKLING2_SHARED_KV=1`, bf16 KV): the 8 whole-cache visits on 2 MiB VMM pages leased per request from one ledger with the prompt cache, a read-only zero page under unwritten rows, snapshots sharing whole pages; 8 × 262,144 bf16 windows with a 20 GiB prompt cache |
+| `0038` | With shared KV, DSpark's global ring on leased pages too (`TF_INKLING2_DRAFT_PAGES=1`), mapped a lease quantum at a time; one drafter stash arena (`mini_stash.zig`) |
+| `0039` | DFlash2 keeps a released stream's ring: a prompt resumed from the prompt cache whose new rows do not fill the 2,048-row window attends its kept context instead of drafting cold (`TF_INKLING2_DRAFT_KEEP=0` for the old path) |
+| `0040` | Optional combined drafter (`DRAFTER=hybrid`, i.e. `TF_INKLING2_DSPARK_DIR` with a DFlash2 `--drafter`): DFlash2 for prompts below `TF_INKLING2_DFLASH2_MAX_PROMPT` (2,048) tokens, DSpark from there; a resumed prompt follows the drafter that holds its context; DFlash2's chances apply only to a step whose one stream drafts with DFlash2 (lanes `Facts.chances_lone`); no prompt trim (`0020`), as DSpark reads every prompt row |
+
+Any one of `0031`–`0037` and `0039`–`0040` can be left out and the rest still apply, except that `0038` needs `0036` and `0037`, and `0040` needs `0032` and `0036`–`0039`.
 
 ## Tools
 
@@ -306,7 +337,7 @@ Applied in order onto TensorFold `dc2ca8a1` (PR #4441) by `scripts/prepare.sh`:
 start.sh      set up (first run) and start the server
 stop.sh       stop it
 scripts/      config.sh, prepare.sh, fetch.sh, banner.sh
-patches/      0001–0030 applied onto TensorFold at TF_REF
+patches/      0001–0040 applied onto TensorFold at TF_REF
 tools/        verification scripts
 CREDITS.md    upstream credits
 NOTICE        third-party notices

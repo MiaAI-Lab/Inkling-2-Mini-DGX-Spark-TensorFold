@@ -1,0 +1,314 @@
+diff --git a/zig/src/families/inkling2/mini_dspark.zig b/zig/src/families/inkling2/mini_dspark.zig
+index 6dc513d..ea644c7 100644
+--- a/zig/src/families/inkling2/mini_dspark.zig
++++ b/zig/src/families/inkling2/mini_dspark.zig
+@@ -217,8 +217,82 @@ const Slot = struct {
+     newest: u64,
+     walk: u64, // int32 [block]: the pending token, then the drafts
+     used: bool = false,
++    // a released stream's context, still in the caches until another stream writes over it (TF_INKLING2_DRAFT_KEEP)
++    kept: std.ArrayList(u32) = .empty, // its committed tokens [0, kept_end)
++    kept_from: u64 = 0, // the rows [kept_from, kept_end) it had absorbed
++    kept_end: u64 = 0,
++    released: u64 = 0, // release order (0: never held a stream): a new stream without a match takes the oldest
+ };
+ 
++/// Rows a kept context must give a resumed prompt to be worth taking over.
++const keep_min = 64;
++
++/// TF_INKLING2_DRAFT_STASH_MIB: device MiB (allocated at load, so the stream budget counts them) for released
++/// streams' contexts copied out of their slots, so a resumed prompt finds its context after its slot was reused
++/// (default 512, ~36 contexts of 1.2K tokens, about as many prompts as a 7-8 GiB prompt cache keeps; 0: none, only a
++/// still-free slot's).
++fn stashBytes() usize {
++    const v = std.c.getenv("TF_INKLING2_DRAFT_STASH_MIB") orelse return 512 << 20;
++    const n = std.fmt.parseInt(usize, std.mem.span(v), 10) catch return 512 << 20;
++    return n << 20;
++}
++
++/// A released stream's context in the stash: its tokens [0, end), rows [from, end) of the global layer and the two
++/// sliding rings whole, at `off`: [k0 ring][v0 ring][k2 ring][v2 ring][k1 rows][v1 rows].
++const Stashed = struct {
++    tokens: std.ArrayList(u32) = .empty,
++    from: u64,
++    end: u64,
++    off: usize,
++    bytes: usize,
++    order: u64,
++};
++
++fn ringBytes() usize {
++    return local_ring * kv_width * 2;
++}
++
++fn stashSize(from: u64, end: u64) usize {
++    return 4 * ringBytes() + 2 * @as(usize, @intCast(end - from)) * kv_width * 2;
++}
++
++/// The first row a context kept through `end` (absorbed from `from`) still holds in its sliding rings: its last hold
++/// wrote a block past `end`, over the ring's oldest rows.
++fn keptFrom(from: u64, end: u64) u64 {
++    return @max(from, (end + block) -| local_ring);
++}
++
++/// Whether a stash entry (kept rows [old_from, old_end) of `old_tokens`) is redundant beside a new one kept from
++/// `from` to `end`: the new one holds every row the old one gives (from its kept start, not the absorbed one; a
++/// longer turn's rings no longer hold an earlier turn's first rows) and continues its tokens.
++fn supersedes(old_from: u64, old_end: u64, old_tokens: []const u32, from: u64, end: u64, tokens: []const u32) bool {
++    return old_from >= from and old_end <= end and old_tokens.len <= tokens.len and std.mem.eql(u32, old_tokens, tokens[0..old_tokens.len]);
++}
++
++/// TF_INKLING2_DRAFT_KEEP=0: a prompt resumed from the target's prompt cache drafts from the resumed rows alone, as
++/// before. Default on: a free slot keeps its last stream's context, and a stream whose restored prompt matches it
++/// attends that context instead of starting cold (proposals only; the target verifies every draft).
++fn keepOn() bool {
++    const S = struct {
++        var v: ?bool = null;
++    };
++    if (S.v == null) S.v = if (std.c.getenv("TF_INKLING2_DRAFT_KEEP")) |e| e[0] != '0' else true;
++    return S.v.?;
++}
++
++/// Where a resumed prompt's drafting context came from: its slot's kept context, the stash, or none (the rows the
++/// stream absorbs from its resume point on).
++const Resume = enum { slot, stash, cold };
++
++/// TF_INKLING2_RESUME_TRACE=1: a line a resumed prompt (where its context came from, the counts so far).
++fn resumeTrace() bool {
++    const S = struct {
++        var v: ?bool = null;
++    };
++    if (S.v == null) S.v = if (std.c.getenv("TF_INKLING2_RESUME_TRACE")) |e| e[0] == '1' else false;
++    return S.v.?;
++}
++
+ const LaneState = struct {
+     slot: usize,
+     from: u64 = 0, // the first committed row the context holds (a resumed prompt starts past 0)
+@@ -279,8 +353,20 @@ pub const Drafter = struct {
+     buffers: std.ArrayList(DeviceBuffer) = .empty,
+     weight_bytes: usize = 0,
+     slots: std.ArrayList(Slot) = .empty,
++    releases: u64 = 0, // streams released so far (each slot's release order)
++    stash: u64 = 0, // TF_INKLING2_DRAFT_STASH_MIB of device memory for released contexts (0: none)
++    stash_cap: usize = 0,
++    stash_at: usize = 0, // where the next stashed context goes (a ring: older entries it overlaps are dropped)
++    stashed: std.ArrayList(Stashed) = .empty,
+     slot_bufs: std.ArrayList(DeviceBuffer) = .empty,
+     lanes: std.AutoHashMapUnmanaged(*Stream, LaneState) = .empty,
++    resumes: [3]u64 = @splat(0), // resumed prompts by where their context came from (Resume)
++
++    fn stashBytesHeld(x: *const Drafter) usize {
++        var n: usize = 0;
++        for (x.stashed.items) |e| n += e.bytes;
++        return n;
++    }
+ 
+     fn alloc(x: *Drafter, bytes: usize) !u64 {
+         var b = try DeviceBuffer.alloc(x.d, @max(bytes, 256));
+@@ -513,6 +599,8 @@ pub const Drafter = struct {
+         x.logits = try x.alloc(max_batch * V * 4);
+         x.raw = try x.alloc(max_batch * 3 * rank * 4);
+         x.picks = try x.alloc(max_batch * pickParts(V) * 8);
++        x.stash_cap = if (keepOn()) stashBytes() else 0;
++        if (x.stash_cap > 0) x.stash = try x.alloc(x.stash_cap);
+         x.po = try x.alloc(x.chunks * block * heads * head_dim * 4);
+         x.pml = try x.alloc(x.chunks * block * heads * 2 * 4);
+         var part: usize = 0;
+@@ -564,6 +652,9 @@ pub const Drafter = struct {
+ 
+     pub fn deinit(x: *Drafter) void {
+         x.lanes.deinit(x.gpa);
++        for (x.slots.items) |*sl| sl.kept.deinit(x.gpa);
++        for (x.stashed.items) |*e| e.tokens.deinit(x.gpa);
++        x.stashed.deinit(x.gpa);
+         for (x.slot_bufs.items) |*b| b.free();
+         x.slot_bufs.deinit(x.gpa);
+         x.slots.deinit(x.gpa);
+@@ -624,9 +715,22 @@ pub const Drafter = struct {
+     fn openFn(ptr: *anyopaque, s: *Stream) anyerror!void {
+         const x = self(ptr);
+         if (x.lanes.contains(s)) return error.DraftStreamOpen;
+-        const slot = for (x.slots.items, 0..) |sl, i| {
+-            if (!sl.used) break i;
+-        } else blk: {
++        // the free slot whose kept context shares the longest prompt prefix, else the one released longest ago
++        var match: ?usize = null;
++        var match_len: usize = keep_min - 1;
++        var oldest: ?usize = null;
++        const prompt = s.prompt();
++        for (x.slots.items, 0..) |sl, i| {
++            if (sl.used) continue;
++            if (oldest == null or sl.released < x.slots.items[oldest.?].released) oldest = i;
++            if (!keepOn() or s.images.len > 0 or sl.kept_end == 0) continue;
++            const n = std.mem.indexOfDiff(u32, sl.kept.items, prompt) orelse @min(sl.kept.items.len, prompt.len);
++            if (n > match_len) {
++                match = i;
++                match_len = n;
++            }
++        }
++        const slot = match orelse oldest orelse blk: {
+             try x.reserve(@intCast(x.slots.items.len + 1)); // past the host's count: one more, if it fits
+             break :blk x.slots.items.len - 1;
+         };
+@@ -636,7 +740,112 @@ pub const Drafter = struct {
+ 
+     fn releaseFn(ptr: *anyopaque, s: *Stream) void {
+         const x = self(ptr);
+-        if (x.lanes.fetchRemove(s)) |e| x.slots.items[e.value.slot].used = false;
++        const e = x.lanes.fetchRemove(s) orelse return;
++        const sl = &x.slots.items[e.value.slot];
++        sl.used = false;
++        x.releases += 1;
++        sl.released = x.releases;
++        sl.kept.clearRetainingCapacity();
++        sl.kept_from = 0;
++        sl.kept_end = 0;
++        const l = e.value;
++        if (!keepOn() or s.images.len > 0 or l.end <= l.from or s.context.items.len < l.end) return;
++        sl.kept.appendSlice(x.gpa, s.context.items[0..@intCast(l.end)]) catch return; // no room: nothing kept
++        sl.kept_from = l.from;
++        sl.kept_end = l.end;
++        if (keptFrom(l.from, l.end) + keep_min <= l.end) x.stashSlot(sl, sl.kept.items, l.from, l.end) catch {};
++    }
++
++    fn dtod(x: *Drafter, dst: u64, src: u64, n: usize) !void {
++        try x.d.check(x.d.api.cuMemcpyDtoDAsync_v2(dst, src, n, x.s.handle), "cuMemcpyDtoDAsync");
++    }
++
++    /// Slot `sl`'s context (tokens [0, end), absorbed from `from`) copied into the stash, on the target's stream (so
++    /// before any later write to the slot); entries it overlaps, or whose context it extends, are dropped. Only the
++    /// global rows a resume can attend are kept, [keptFrom(from, end), end) like the sliding rings' (at most
++    /// local_ring - block rows): a stashed context is ~13.5 MiB at most, whatever the prompt's length.
++    fn stashSlot(x: *Drafter, sl: *const Slot, tokens: []const u32, absorbed: u64, end: u64) !void {
++        if (x.stash_cap == 0 or end <= absorbed) return;
++        const from = keptFrom(absorbed, end);
++        const size = stashSize(from, end);
++        if (size > x.stash_cap) return;
++        if (x.stash_at + size > x.stash_cap) x.stash_at = 0;
++        const lo = x.stash_at;
++        const hi = lo + size;
++        var i: usize = 0;
++        while (i < x.stashed.items.len) {
++            const e = &x.stashed.items[i];
++            const over = e.off < hi and lo < e.off + e.bytes;
++            const older = supersedes(e.from, e.end, e.tokens.items, from, end, tokens);
++            if (over or older) {
++                e.tokens.deinit(x.gpa);
++                _ = x.stashed.swapRemove(i);
++            } else i += 1;
++        }
++        var e: Stashed = .{ .from = from, .end = end, .off = lo, .bytes = size, .order = x.releases };
++        try e.tokens.appendSlice(x.gpa, tokens);
++        errdefer e.tokens.deinit(x.gpa);
++        const rb = ringBytes();
++        var at = x.stash + lo;
++        for ([_]usize{ 0, 2 }) |li| {
++            try x.dtod(at, sl.k[li], rb);
++            at += rb;
++            try x.dtod(at, sl.v[li], rb);
++            at += rb;
++        }
++        const gb = @as(usize, @intCast(end - from)) * kv_width * 2;
++        const g0 = @as(usize, @intCast(from)) * kv_width * 2;
++        try x.dtod(at, sl.k[1] + g0, gb);
++        try x.dtod(at + gb, sl.v[1] + g0, gb);
++        try x.stashed.append(x.gpa, e);
++        x.stash_at = hi;
++    }
++
++    /// The newest stashed context holding tokens [0, start) of `s`, copied into `sl`: the first row it gives back;
++    /// null: none matches (the stream starts at `start`).
++    fn unstash(x: *Drafter, s: *const Stream, sl: *const Slot, start: u64) !?u64 {
++        if (x.stash_cap == 0 or s.images.len > 0) return null;
++        const n: usize = @intCast(start);
++        if (s.context.items.len < n) return null;
++        var best: ?usize = null;
++        for (x.stashed.items, 0..) |e, i| {
++            if (start > e.end or e.tokens.items.len < n) continue;
++            if (keptFrom(e.from, e.end) + keep_min > start) continue;
++            if (best != null and e.order <= x.stashed.items[best.?].order) continue;
++            if (!std.mem.eql(u32, e.tokens.items[0..n], s.context.items[0..n])) continue;
++            best = i;
++        }
++        const e = x.stashed.items[best orelse return null];
++        const from = keptFrom(e.from, e.end);
++        const rb = ringBytes();
++        var at = x.stash + e.off;
++        for ([_]usize{ 0, 2 }) |li| {
++            try x.dtod(sl.k[li], at, rb);
++            at += rb;
++            try x.dtod(sl.v[li], at, rb);
++            at += rb;
++        }
++        const all = @as(usize, @intCast(e.end - e.from)) * kv_width * 2;
++        const skip = @as(usize, @intCast(from - e.from)) * kv_width * 2;
++        const gb = @as(usize, @intCast(start - from)) * kv_width * 2;
++        const g0 = @as(usize, @intCast(from)) * kv_width * 2;
++        try x.dtod(sl.k[1] + g0, at + skip, gb);
++        try x.dtod(sl.v[1] + g0, at + all + skip, gb);
++        return from;
++    }
++
++    /// The first row a stream resumed at `start` (its prompt restored from the target's cache) can attend in its
++    /// slot's kept context: tokens [0, start) must be the kept stream's, and the sliding rings still hold the kept
++    /// stream's last local_ring - block rows (its last hold wrote a block past its end); null: start cold.
++    fn resumeFrom(x: *const Drafter, s: *const Stream, sl: *const Slot, start: u64) ?u64 {
++        _ = x;
++        if (!keepOn() or s.images.len > 0 or sl.kept_end == 0 or start > sl.kept_end) return null;
++        const n: usize = @intCast(start);
++        if (s.context.items.len < n or sl.kept.items.len < n) return null;
++        if (!std.mem.eql(u32, sl.kept.items[0..n], s.context.items[0..n])) return null;
++        const from = keptFrom(sl.kept_from, sl.kept_end);
++        if (from + keep_min > start) return null;
++        return from;
+     }
+ 
+     fn heldFn(ptr: *anyopaque, streams: []const *Stream, out: []const []u32) anyerror!void {
+@@ -687,8 +896,23 @@ pub const Drafter = struct {
+             if (item.rows != null) return error.TreesNotBuilt;
+             if (f.rows == 0) continue;
+             if (item.start + f.rows > x.context) return error.DraftContextGap;
+-            if (item.start > l.end or l.end == 0) l.from = item.start; // a gap (a resumed prompt): attend from here
+             const sl = &x.slots.items[l.slot];
++            if (item.start > l.end or l.end == 0) {
++                // a gap (a resumed prompt): attend from here, or from the slot's kept context when it is this prompt's
++                l.from = item.start;
++                if (l.end == 0 and item.start > 0) {
++                    var how: Resume = .cold;
++                    if (x.resumeFrom(item.stream, sl, item.start)) |from| {
++                        l.from = from;
++                        how = .slot;
++                    } else if (try x.unstash(item.stream, sl, item.start)) |from| {
++                        l.from = from;
++                        how = .stash;
++                    }
++                    x.resumes[@intFromEnum(how)] += 1;
++                    if (resumeTrace()) std.log.info("Inkling 2 Mini DSpark: resumed at {d} from the {s}, attending rows {d}..{d}; resumes slot {d}, stash {d}, cold {d}; stash {d} entries, {d} MiB", .{ item.start, @tagName(how), l.from, item.start, x.resumes[0], x.resumes[1], x.resumes[2], x.stashed.items.len, x.stashBytesHeld() >> 20 });
++                }
++            }
+             var done: usize = 0;
+             while (done < f.rows) {
+                 const n = @min(absorb_rows, f.rows - done);
+@@ -1043,3 +1267,21 @@ test "rings hold a block past the window, and a stream's bytes count all three l
+     try std.testing.expectEqual(2 * 2 * 1152 * 1024 * 2 + 2 * 32896 * 1024 * 2 + 2304 * 2 + 256, laneBytes(32768));
+     try std.testing.expectEqual(@as(usize, 4 * 2304 * 2), row_bytes);
+ }
++
++test "a stash entry is superseded only by one that still holds every row it gives" {
++    var toks: [1700]u32 = undefined;
++    for (&toks, 0..) |*t, i| t.* = @intCast(i);
++    // turn 1 kept rows [0, 1000); turn 2 resumed it and ran to 1600, its rings holding [456, 1600) only
++    try std.testing.expectEqual(@as(u64, 0), keptFrom(0, 1000));
++    try std.testing.expectEqual(@as(u64, 456), keptFrom(0, 1600));
++    try std.testing.expect(!supersedes(keptFrom(0, 1000), 1000, toks[0..1000], keptFrom(0, 1600), 1600, toks[0..1600]));
++    // turn 3 to 1700 holds [556, 1700): not turn 2's [456, 1600) either; the same context kept again does
++    try std.testing.expect(!supersedes(456, 1600, toks[0..1600], keptFrom(0, 1700), 1700, toks[0..1700]));
++    try std.testing.expect(supersedes(456, 1600, toks[0..1600], 456, 1600, toks[0..1600]));
++    // short contexts inside the rings: the longer one holds the shorter one's rows
++    try std.testing.expect(supersedes(0, 300, toks[0..300], keptFrom(0, 900), 900, toks[0..900]));
++    // a different prompt never supersedes
++    var other = toks;
++    other[10] = 99999;
++    try std.testing.expect(!supersedes(0, 300, toks[0..300], 0, 900, other[0..900]));
++}
