@@ -1,0 +1,293 @@
+diff --git a/zig/kernels/cuda/inkling2/loop.cu b/zig/kernels/cuda/inkling2/loop.cu
+index 9e2f5b6..c85f93c 100644
+--- a/zig/kernels/cuda/inkling2/loop.cu
++++ b/zig/kernels/cuda/inkling2/loop.cu
+@@ -226,6 +226,8 @@ constexpr int kDC = 256;
+ extern "C" __global__ void __launch_bounds__(kThreads) tf_ink2_loop_gate_down_rows(const LoopGateArgs a, const uint16_t* xs) {
+     __shared__ __align__(16) uint16_t sx[kDR][kDC];
+     __shared__ __align__(16) uint16_t sw[kWarps * kDK][kDC];
++    __shared__ float red[kWarps];
++    __shared__ float inv[kDR][2];
+     const int g = blockIdx.y, H = a.H, R = a.rank, H2 = 2 * H;
+     const size_t row0 = static_cast<size_t>(blockIdx.x) * kDR;
+     const int nr = min(kDR, a.rows - static_cast<int>(row0));
+@@ -237,16 +239,42 @@ extern "C" __global__ void __launch_bounds__(kThreads) tf_ink2_loop_gate_down_ro
+     for (int k = 0; k < kDK; ++k)
+ #pragma unroll
+         for (int j = 0; j < kDR; ++j) acc[k][j] = 0.0f;
+-    const uint16_t* x0 = xs + (static_cast<size_t>(g) * a.rows + row0) * H2;
++    // For prompt rows only, normalize inside the down CTA instead of materializing BF16 [rows, 2H]
++    // into the ys scratch and immediately reading it back. The reduction order matches gate_prep.
++    if (!xs) {
++        for (int j = 0; j < nr; ++j) {
++            const float* h = a.h[g] + (row0 + j) * H;
++            const float* m = a.msg + a.slot[g] * a.msg_stride + (row0 + j) * H;
++            float sh_acc = 0.0f, sm_acc = 0.0f;
++            for (int i = threadIdx.x; i < H; i += kThreads) {
++                sh_acc = fmaf(h[i], h[i], sh_acc);
++                sm_acc = fmaf(m[i], m[i], sm_acc);
++            }
++            const float ih = rsqrtf(blockSum(sh_acc, red) / static_cast<float>(H) + a.eps_unit);
++            const float im = rsqrtf(blockSum(sm_acc, red) / static_cast<float>(H) + a.eps_unit);
++            if (threadIdx.x == 0) { inv[j][0] = ih; inv[j][1] = im; }
++        }
++        __syncthreads();
++    }
++    const uint16_t* x0 = xs ? xs + (static_cast<size_t>(g) * a.rows + row0) * H2 : nullptr;
+     const uint16_t* w0 = a.down_w[g] + static_cast<size_t>(rb) * H2;
+     constexpr int V = kDC / 8;  // uint4 per staged row
+     for (int c0 = 0; c0 < H2; c0 += kDC) {
+         __syncthreads();
+         for (int e = threadIdx.x; e < kDR * V; e += kThreads) {
+             const int j = e / V, v = e - j * V;
+-            uint4 val = make_uint4(0, 0, 0, 0);
+-            if (j < nr) val = *reinterpret_cast<const uint4*>(x0 + static_cast<size_t>(j) * H2 + c0 + v * 8);
+-            *reinterpret_cast<uint4*>(&sx[j][v * 8]) = val;
++            if (j < nr && !xs) {
++                const float* h = a.h[g] + (row0 + j) * H;
++                const float* m = a.msg + a.slot[g] * a.msg_stride + (row0 + j) * H;
++                for (int b = 0; b < 8; ++b) {
++                    const int c = c0 + v * 8 + b;
++                    sx[j][v * 8 + b] = c < H ? tobf(h[c] * inv[j][0]) : tobf(m[c - H] * inv[j][1]);
++                }
++            } else {
++                uint4 val = make_uint4(0, 0, 0, 0);
++                if (j < nr) val = *reinterpret_cast<const uint4*>(x0 + static_cast<size_t>(j) * H2 + c0 + v * 8);
++                *reinterpret_cast<uint4*>(&sx[j][v * 8]) = val;
++            }
+         }
+         for (int e = threadIdx.x; e < kWarps * kDK * V; e += kThreads) {
+             const int k = e / V, v = e - k * V;
+diff --git a/zig/kernels/cuda/qmmf.cu b/zig/kernels/cuda/qmmf.cu
+index c08ad62..451f9e9 100644
+--- a/zig/kernels/cuda/qmmf.cu
++++ b/zig/kernels/cuda/qmmf.cu
+@@ -71,6 +71,28 @@ __global__ void __launch_bounds__(WM * WN * 32) qmmf_kernel(
+ #undef TF_QMMF_WFIRST
+ }
+ 
++// The prompt's fused attention projection already computes all columns in one FP8 GEMM. Store each
++// column pair directly in its consumer's row plane, instead of writing and splitting a dense matrix.
++struct SplitCols {
++    uint16_t* dst[6];
++    int off[6], w[6], n;
++};
++
++extern "C" __global__ void __launch_bounds__(128) tf_qmmf_prefill_split(
++        const __nv_bfloat16* __restrict__ x, const unsigned char* __restrict__ w,
++        const uint8_t* __restrict__ bs, float scale, void* __restrict__ out,
++        float* __restrict__ part, int M, int N, int K, int SK, int npad, int ldx,
++        int group, const SplitCols split) {
++    constexpr int MODE = FP8, BM = 64, BN = 64, WM = 1, WN = 4, STAGES = 4;
++    constexpr bool F32 = false, CLUSTER = false, FUSE = true;
++    qmm_frag::grid_launch();
++#define TF_QMMF_WFIRST
++#define TF_QMMF_SPLIT
++#include "qmmf_body.cuh"
++#undef TF_QMMF_SPLIT
++#undef TF_QMMF_WFIRST
++}
++
+ // The shared down has one K slice; only the output address changes from the existing BF16-weight product.
+ #define TF_SHARED_DOWN(NAME, BM, BN) \
+ extern "C" __global__ void __launch_bounds__(128) NAME( \
+diff --git a/zig/kernels/cuda/qmmf_body.cuh b/zig/kernels/cuda/qmmf_body.cuh
+index f3dc2ee..1d393c1 100644
+--- a/zig/kernels/cuda/qmmf_body.cuh
++++ b/zig/kernels/cuda/qmmf_body.cuh
+@@ -321,7 +321,15 @@
+                     if (col < N) dst[0] = v0;
+                     if (col + 1 < N) dst[1] = v1;
+                 } else {
+-#ifdef TF_QMMF_STRIDED
++#ifdef TF_QMMF_SPLIT
++                    if (col >= N) continue;
++                    int plane = 0;
++                    for (; plane < split.n; ++plane)
++                        if (col >= split.off[plane] && col < split.off[plane] + split.w[plane]) break;
++                    if (plane == split.n) continue;
++                    __nv_bfloat16* dst = reinterpret_cast<__nv_bfloat16*>(split.dst[plane]) +
++                        static_cast<size_t>(row) * split.w[plane] + col - split.off[plane];
++#elif defined(TF_QMMF_STRIDED)
+                     __nv_bfloat16* dst = reinterpret_cast<__nv_bfloat16*>(out) + static_cast<size_t>(row) * ldy + col;
+ #else
+                     __nv_bfloat16* dst = reinterpret_cast<__nv_bfloat16*>(out) + static_cast<size_t>(row) * N + col;
+diff --git a/zig/src/cuda/qmmf.zig b/zig/src/cuda/qmmf.zig
+index 5a5269f..2e1c3a9 100644
+--- a/zig/src/cuda/qmmf.zig
++++ b/zig/src/cuda/qmmf.zig
+@@ -55,6 +55,13 @@ pub fn bucket(m: usize) u32 {
+ 
+ /// A packed projection on the device: codes or words, scale tiles, the tensor scale, its shape, its input scale (act).
+ pub const Weight = struct { mode: Mode, codes: u64, scales: u64, scale: f32 = 1.0, n: u32, k: u32, npad: u32, act: f32 = 0, sk: u32 = 0 };
++/// The fused prompt attention projection's row planes, matching qmmf.cu SplitCols.
++pub const SplitCols = extern struct {
++    dst: [6]u64 = @splat(0),
++    off: [6]i32 = @splat(0),
++    w: [6]i32 = @splat(0),
++    n: i32 = 0,
++};
+ 
+ /// `w` with its K slices pinned to `sk`: 1, 2, 4 or 8, dividing its groups and leaving at least 8 a slice.
+ pub fn pinned(w: Weight, sk: u32) error{BadSplit}!Weight {
+@@ -182,6 +189,7 @@ pub const Lane = struct {
+     fns: [modes.len][7]Function, // per mode: lane16, lane16c, lane32, lane32c, lane64, lane64c, fused
+     f32_fns: [modes.len][7]Function,
+     reduce: [2]Function, // by Out
++    prefill_split: Function, // FP8 fused-row projection with direct consumer-plane stores
+     half: [2][2][2]Function, // by halfModeIndex, Out, then plain / cluster
+     half_below: usize = half_below_default,
+     shared_down: [4]Function = undefined,
+@@ -200,6 +208,7 @@ pub const Lane = struct {
+             .fns = undefined,
+             .f32_fns = undefined,
+             .reduce = undefined,
++            .prefill_split = undefined,
+             .half = undefined,
+             .clusters = capability_major >= 9,
+         };
+@@ -207,6 +216,8 @@ pub const Lane = struct {
+             l.fns[mi] = try loadTiles(mod, mode, false);
+             l.f32_fns[mi] = try loadTiles(mod, mode, true);
+         }
++        l.prefill_split = try mod.function("tf_qmmf_prefill_split");
++        try l.prefill_split.allowDynamicShared(sharedBytes(.fp8, 64));
+         for (&l.reduce, reduce_symbols) |*f, name| f.* = try mod.function(name);
+         inline for (.{ Mode.mxfp8, Mode.bf16 }, 0..) |mode, mi| inline for (.{ false, true }, 0..) |wide, oi| inline for (.{ false, true }, 0..) |cl, ci| {
+             const f = try mod.function(halfSymbol(mode, cl, wide));
+@@ -274,6 +285,36 @@ pub const Lane = struct {
+             2 * promptBlocks(m, w.n) > l.prompt_sms;
+     }
+ 
++    /// Prompt FP8 fused-row projection directly to its disjoint attention row planes. The FP8
++    /// MMA/reduction and BF16 rounding are the ordinary qmmf<1,m64,n64,fuse1> path; only stores move.
++    pub fn matmulSplit(l: Lane, s: Stream, x: u64, ldx: usize, m: usize, w: Weight, split: SplitCols) !void {
++        const p = planFor(m, w, l.clusters);
++        if (w.mode != .fp8 or !p.fused or p.cluster or p.reduce) return error.UnsupportedPromptSplit;
++        const rows_t = (m + 63) / 64;
++        const band = @max(1, @min(rows_t, (12 << 20) / (64 * w.k * 2)));
++        var args: launch_.Args = .{};
++        args.add(x);
++        args.add(w.codes);
++        args.add(w.scales);
++        args.add(w.scale);
++        args.add(@as(u64, 0));
++        args.add(@as(u64, 0));
++        args.add(@as(i32, @intCast(m)));
++        args.add(@as(i32, @intCast(w.n)));
++        args.add(@as(i32, @intCast(w.k)));
++        args.add(@as(i32, @intCast(p.sk)));
++        args.add(@as(i32, @intCast(w.npad)));
++        args.add(@as(i32, @intCast(ldx)));
++        args.add(@as(i32, @intCast(band)));
++        args.add(split);
++        try launch_.launch(l.prefill_split, .{
++            .grid = .{ .x = @intCast(rows_t * ((w.n + bn - 1) / bn)), .y = 1, .z = 1 },
++            .block = .{ .x = threads, .y = 1, .z = 1 },
++            .shared = sharedBytes(.fp8, 64),
++            .pdl = l.pdl,
++        }, s, &args);
++    }
++
+     /// matmul() writing y as `out` says: bf16, or fp32.
+     pub fn matmulOut(l: Lane, s: Stream, x: u64, ldx: usize, m: usize, w: Weight, y: u64, out: Out, part: u64) !void {
+         const p = planFor(m, w, l.clusters);
+diff --git a/zig/src/families/inkling2/loop.zig b/zig/src/families/inkling2/loop.zig
+index 9fdfd6b..519f2a5 100644
+--- a/zig/src/families/inkling2/loop.zig
++++ b/zig/src/families/inkling2/loop.zig
+@@ -126,8 +126,14 @@ pub fn mixLayers(k: *const Kernels, s: cuda.Stream, a: MixArgs, layers: usize, q
+ 
+ /// The gates' rank-r down rows, then the gated, normed inputs: a block a (row, gate) each.
+ pub fn gates(k: *const Kernels, s: cuda.Stream, a: GateArgs, n: usize) !void {
+-    if (k.tiled and check.on()) return check.run(k, s, a, n);
+-    return gatesWith(k, k.tiled, s, a, n);
++    if (k.tiled and check.on()) return check.run(k, s, a, n, false);
++    return gatesWith(k, k.tiled, s, a, n, false);
++}
++
++/// Prompt-only fusion: prepare each gate's unit-normalized state/message inside the row-tiled down CTA.
++pub fn gatesPrefill(k: *const Kernels, s: cuda.Stream, a: GateArgs, n: usize) !void {
++    if (k.tiled and check.on()) return check.run(k, s, a, n, true);
++    return gatesWith(k, k.tiled, s, a, n, true);
+ }
+ 
+ /// TF_INKLING2_LOOP_CHECK=1 (ungraphed only): each gates call runs the original kernels, then the tiled ones, and compares
+@@ -159,12 +165,12 @@ const check = struct {
+         try s.d.check(s.d.api.cuMemcpyDtoH_v2(buf[n * plane ..].ptr, a.down, down), "dtoh");
+         return buf;
+     }
+-    fn run(k: *const Kernels, s: cuda.Stream, a: GateArgs, n: usize) !void {
++    fn run(k: *const Kernels, s: cuda.Stream, a: GateArgs, n: usize, prefill: bool) !void {
+         const gpa = std.heap.page_allocator;
+-        try gatesWith(k, false, s, a, n);
++        try gatesWith(k, false, s, a, n, false);
+         const want = try grab(s, gpa, a, n);
+         defer gpa.free(want);
+-        try gatesWith(k, true, s, a, n);
++        try gatesWith(k, true, s, a, n, prefill);
+         const got = try grab(s, gpa, a, n);
+         defer gpa.free(got);
+         const split = want.len - n * @as(usize, @intCast(a.rows)) * @as(usize, @intCast(a.rank)) * 2;
+@@ -176,7 +182,7 @@ const check = struct {
+     }
+ };
+ 
+-fn gatesWith(k: *const Kernels, tiled: bool, s: cuda.Stream, a: GateArgs, n: usize) !void {
++fn gatesWith(k: *const Kernels, tiled: bool, s: cuda.Stream, a: GateArgs, n: usize, prefill: bool) !void {
+     try gateFits(a, n);
+     var args: cuda.Args = .{};
+     args.add(a);
+@@ -186,11 +192,13 @@ fn gatesWith(k: *const Kernels, tiled: bool, s: cuda.Stream, a: GateArgs, n: usi
+     const rows: u32 = @intCast(a.rows);
+     const rank: u32 = @intCast(a.rank);
+     if (tiled and rows >= tiled_down_min_rows and @as(u32, @intCast(2 * a.h_dim)) % 256 == 0) {
+-        // xs (bf16 [gates][rows][2H]) borrows ys, which gate_lin writes only after gate_down has read it
++        // xs (bf16 [gates][rows][2H]) borrows ys, which gate_lin writes only after gate_down has read it.
++        // Only prompt rank-64 gates have one rank CTA per row tile, so the fused norm is computed once.
++        const fused = prefill and rank == 64 and h % 8 == 0;
+         var pa: cuda.Args = .{};
+         pa.add(a);
+-        pa.add(a.ys);
+-        try cuda.launch.launch(k.gate_prep, .{ .grid = grid, .block = .{ .x = threads } }, s, &pa);
++        pa.add(if (fused) @as(u64, 0) else a.ys);
++        if (!fused) try cuda.launch.launch(k.gate_prep, .{ .grid = grid, .block = .{ .x = threads } }, s, &pa);
+         const dg: cuda.Dim3 = .{ .x = std.math.divCeil(u32, rows, down_rows) catch unreachable, .y = grid.y, .z = std.math.divCeil(u32, rank, down_ranks) catch unreachable };
+         try cuda.launch.launch(k.gate_down_rows, .{ .grid = dg, .block = .{ .x = threads } }, s, &pa);
+     } else {
+diff --git a/zig/src/families/inkling2/mini_visit.zig b/zig/src/families/inkling2/mini_visit.zig
+index e116ace..24b646f 100644
+--- a/zig/src/families/inkling2/mini_visit.zig
++++ b/zig/src/families/inkling2/mini_visit.zig
+@@ -174,7 +174,7 @@ fn gated(m: *Model, k: *const Kernels, s: cuda.Stream, r: *const Rows, nb: usize
+         g.gain[i] = ctl[i].gain;
+         g.norm[i] = norms[i];
+     }
+-    try loop.gates(&k.loop, s, g, ctl.len);
++    if (r.prompt) try loop.gatesPrefill(&k.loop, s, g, ctl.len) else try loop.gates(&k.loop, s, g, ctl.len);
+ }
+ 
+ /// A short conv at `site` of visit `v` over the call's streams (their states by slot).
+@@ -241,7 +241,6 @@ fn visitOne(m: *Model, k: *const Kernels, s: cuda.Stream, r: *const Rows, v: u32
+         // then each part copied to the plane its consumers read
+         const f = wts.Fused.of(t);
+         const ld: usize = if (separate) f.qx else f.all;
+-        try proj(m, k, s, if (separate) a.qx else a.all, xq, m.s.fused, n);
+         const qw: usize = @as(usize, t.local.q) * t.local.dim;
+         var sc: ops.SplitCols = .{ .n = if (separate) 4 else 6 };
+         const parts = [6]struct { u64, usize, usize }{ .{ o.q, f.q, qw }, .{ o.gate, f.gate, qw }, .{ o.rel, f.rel, @as(usize, t.local.q) * t.d_rel }, .{ o.sink, f.sink, t.local.q }, .{ o.k, f.k, kvWidth(m) }, .{ o.v, f.v, kvWidth(m) } };
+@@ -250,7 +249,13 @@ fn visitOne(m: *Model, k: *const Kernels, s: cuda.Stream, r: *const Rows, v: u32
+             sc.off[pi] = @intCast(pt[1]);
+             sc.w[pi] = @intCast(pt[2]);
+         }
+-        try ops.splitCols(&k.ops, s, m.s.fused, ld, n, sc);
++        const weight = if (separate) a.qx else a.all;
++        if (r.prompt and weight.mode == .fp8 and cuda.qmmf.planFor(n, weight, k.lane.clusters).fused) {
++            try k.lane.matmulSplit(s, xq, weight.k, n, weight, .{ .dst = sc.dst, .off = sc.off, .w = sc.w, .n = sc.n });
++        } else {
++            try proj(m, k, s, weight, xq, m.s.fused, n);
++            try ops.splitCols(&k.ops, s, m.s.fused, ld, n, sc);
++        }
+         if (separate) {
+             try proj(m, k, s, a.wk, xk, o.k, n);
+             try proj(m, k, s, a.wv, xv, o.v, n);
