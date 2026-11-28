@@ -14,7 +14,7 @@
 Serve **[Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)** on a single **NVIDIA DGX Spark** (GB10, `sm_121`, 128 GB
 unified memory) through an OpenAI-compatible API (plus a `/v1/messages` Messages-format endpoint). It runs [TensorFold](https://github.com/ashhart/TensorFold)'s Zig engine
 (`tensorfold-native`, Jürgen Schmied's Inkling 2 Mini CUDA engine at [PR #4441](https://github.com/ashhart/TensorFold/pull/4441), commit
-`dc2ca8a1`) plus `patches/0001`–`0030` in NVIDIA's PyTorch container. It has native CUDA vision (`inkling2_vision`: PNG, JPEG, WebP) and
+`dc2ca8a1`) plus the patches in `patches/` in NVIDIA's PyTorch container. It has native CUDA vision (`inkling2_vision`: PNG, JPEG, WebP) and
 structured output and tool calling (`libtfgrammar.so`).
 
 - **Model:** a looped mixture of experts.
@@ -246,7 +246,7 @@ All defaults live in [`scripts/config.sh`](scripts/config.sh). Override them fro
 | `VISION_MAX_IMAGES` / `VISION_IMAGE_TOKENS` | unset | images a request (engine default 4, up to 100) and an image's token budget (default 4,096) |
 | `THINKING` / `REASONING_EFFORT` | `1` / unset | thinking toggle and an optional default effort (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or `0`–`0.99`) |
 | `TEMPERATURE` / `TOP_P` / `TOP_K` | `1.0` / `1.0` / `0` | default sampling (a request's own values win) |
-| `MAX_TOKENS` | `32768` | reply budget when a request sets none |
+| `MAX_TOKENS` | `32768` | reply budget when a request sets none; see [thinking-budget handoff](docs/thinking-budget/README.md) for native thinking caps |
 | `PORT` / `HOST` | `8888` / `0.0.0.0` | API listen address |
 | `TENSORFOLD_MEMORY_RESERVE_GIB` | `9` | memory kept free when sizing the KV and prompt-cache pool |
 | `TF_INKLING2_ATTN_FP8` | `1` | FP8 attention projections (`0` for exact bf16) |
@@ -270,7 +270,7 @@ All defaults live in [`scripts/config.sh`](scripts/config.sh). Override them fro
 - **Exact serial reference:** `"draft": false` on any request turns drafting off. Drafted replies match `"draft": false` token for token.
 - **Admission:** when all `PARALLEL` slots are full, new requests are rejected rather than queued.
 
-## Patches (`patches/0001`–`0030`)
+## Patches
 
 Applied in order onto TensorFold `dc2ca8a1` (PR #4441) by `scripts/prepare.sh`:
 

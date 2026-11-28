@@ -1,0 +1,125 @@
+diff --git a/zig/build/cuda_server_host.zig b/zig/build/cuda_server_host.zig
+--- a/zig/build/cuda_server_host.zig
++++ b/zig/build/cuda_server_host.zig
+@@ -31,6 +31,7 @@
+     flush.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = native_modules.api, .filters = &.{"prompt cache flush:"} })).step);
+     flush.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"prompt cache flush"} })).step);
+     b.step("test-drama-cfg-host", "Drama CFG CLI, HTTP and voice transitions without GPU execution").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"CFG"} })).step);
++    b.step("test-inkling-budget-host", "Native Inkling budget handoff to the answer grammar").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"Inkling budget:"} })).step);
+     b.step("test-speech-redraw-deadline-host", "Busy speech redraw expiry without counting an unsubmitted take").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"a busy redraw stops at its latest start"} })).step);
+     b.step("test-server-keepalive-host", "Silent engine keepalives and cancellation through the threaded server").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"a silent engine's stream gets keepalives before its first token"} })).step);
+     @import("proposal_vocab_host.zig").steps(b, mods.core);
+diff --git a/zig/src/server/server.zig b/zig/src/server/server.zig
+--- a/zig/src/server/server.zig
++++ b/zig/src/server/server.zig
+@@ -256,6 +256,10 @@
+             srv.think_close_end = end;
+         }
+         srv.info.thinking_applicable = srv.close_id != null;
++        if (text.vtable.format == .inkling) {
++            srv.think_close = &[_]u32{ 200010, 200001, 200004 };
++            srv.think_close_end = 200004;
++        }
+         srv.info.thinking_switch = try @import("prompt.zig").thinkingSwitch(srv);
+         if (srv.info.prefill_step > 0) {
+             srv.chunks = try chunk_plan.markers(srv, a, srv.info.prefill_step);
+diff --git a/zig/src/server/root.zig b/zig/src/server/root.zig
+--- a/zig/src/server/root.zig
++++ b/zig/src/server/root.zig
+@@ -79,6 +79,7 @@
+     _ = @import("tool_grammar_lfm2_test.zig");
+     _ = @import("tool_required_test.zig");
+     _ = @import("tool_think_test.zig");
++    _ = @import("inkling_budget_test.zig");
+     _ = @import("structure_field_test.zig");
+     _ = @import("grammar.zig");
+     _ = @import("grammar_compile_test.zig");
+diff --git a/zig/src/server/inkling_budget_test.zig b/zig/src/server/inkling_budget_test.zig
+new file mode 100644
+--- /dev/null
++++ b/zig/src/server/inkling_budget_test.zig
+@@ -0,0 +1,84 @@
++//! Public-checkpoint examples through request preparation and the real native budget/JSON grammar handoff.
++const std = @import("std");
++const api = @import("engine_api");
++const lanes = @import("lanes");
++const json = @import("json");
++const Server = @import("server.zig").Server;
++const Cx = @import("errors.zig").Cx;
++const t = std.testing;
++const close = [_]u32{ 200010, 200001, 200004 };
++const eos = 200006;
++const Present = struct {
++    pub fn check(_: @This()) bool {
++        return false;
++    }
++};
++
++fn prepare(srv: *Server, cx: *Cx, fields: []const u8) !@import("chat.zig").Prepared {
++    const body = (try json.parse(cx.a, "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"Return one integer.\"}],\"max_tokens\":64}")).ok;
++    const extra = (try json.parse(cx.a, fields)).ok;
++    for (extra.object.keys(), extra.object.values()) |key, value| try body.object.put(cx.a, key, value);
++    const input = try @import("openai.zig").chatInput(srv, cx, body);
++    return @import("chat.zig").prepare(srv, cx, input, Present{});
++}
++
++fn drive(a: std.mem.Allocator, srv: *Server, request: api.Request, incomplete: bool) !bool {
++    const st = request.structure.?;
++    const constraint = try st.compiler.?.constrained(a, st.compiled.?, st.after);
++    defer constraint.deinit(a);
++    var stream = try lanes.Stream.init(a, .{ .id = "budget", .prompt = request.prompt, .max_new = request.max_tokens, .eos = srv.eos, .drafts = false, .grammar = constraint, .think_budget = request.think_budget, .think_close = if (incomplete) &.{ 200010, 200004 } else request.think_close, .think_end = if (request.think_end) |id| id else -1, .think_open = true });
++    defer stream.deinit(a);
++    const x = (try srv.text.encode(a, "A", false))[0];
++    const proposed = try a.alloc(u32, request.think_budget + 2);
++    @memset(proposed, x);
++    proposed[0] = 200001;
++    proposed[1] = 200008;
++    const cut = stream.thinkCut(proposed) orelse return error.BudgetNotApplied;
++    try t.expectEqual(request.think_budget - 1, cut);
++    try t.expectEqual(cut, try stream.commit(a, proposed[0..cut], &.{}));
++    const first = try stream.startClose(a);
++    _ = try stream.commit(a, &.{first}, &.{});
++    while (stream.popForce()) |id| _ = try stream.commit(a, &.{id}, &.{});
++    const answer = try srv.text.encode(a, "{\"value\":1}", false);
++    _ = try stream.commit(a, try std.mem.concat(a, u32, &.{ answer, &.{ 200010, eos } }), &.{});
++    if (incomplete) return stream.reason == .@"error";
++    try t.expect(stream.reason == .stop);
++    try t.expectEqualSlices(u32, &close, stream.emitted()[cut..][0..close.len]);
++    const reply = try @import("inkling_reply.zig").split(a, try srv.text.decode(a, stream.emitted()), true, &.{});
++    const value = (try json.parse(a, reply.content)).ok;
++    try t.expectEqual(@as(i64, 1), value.get("value").?.int64().?);
++    return true;
++}
++
++test "Inkling budget: complete native close hands off to JSON; incomplete close is rejected" {
++    const dir_c = std.c.getenv("TF_INKLING_TEST_DIR") orelse return error.SkipZigTest;
++    var arena = std.heap.ArenaAllocator.init(t.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const dir = std.mem.span(dir_c);
++    var problem: []const u8 = "";
++    const hf = try @import("hf_text.zig").HfText.load(a, t.io, dir, null, a, &problem);
++    defer hf.deinit();
++    var stub: @import("tool_required_test.zig").Stub = .{};
++    const srv = try Server.init(t.allocator, t.io, stub.engine(), hf.text(), .{ .served_name = "m", .model_ids = &.{"m"}, .model_dir = dir, .enable_thinking = true }, null);
++    defer srv.deinit();
++    srv.info.structures = true;
++    for ([_]u32{ 6, 12 }) |budget| {
++        var cx: Cx = .{ .a = a };
++        const fields = try std.fmt.allocPrint(a, "{{\"thinking_budget\":{d},\"response_format\":{{\"type\":\"json_schema\",\"json_schema\":{{\"name\":\"value\",\"schema\":{{\"type\":\"object\",\"properties\":{{\"value\":{{\"type\":\"integer\"}}}},\"required\":[\"value\"],\"additionalProperties\":false}}}}}}}}", .{budget});
++        const prepared = try prepare(srv, &cx, fields);
++        defer srv.release(prepared.preparing, prepared.request);
++        try t.expectEqual(budget, prepared.request.think_budget);
++        try t.expect(try drive(a, srv, prepared.request, false));
++        try t.expect(try drive(a, srv, prepared.request, true));
++    }
++    for ([_]i64{ 0, 12 }) |default| {
++        srv.config.thinking_budget = default;
++        for ([_][]const u8{ "{}", "{\"thinking_budget\":0}", "{\"chat_template_kwargs\":{\"enable_thinking\":false},\"thinking_budget\":6}" }, 0..) |fields, i| {
++            var cx: Cx = .{ .a = a };
++            const prepared = try prepare(srv, &cx, fields);
++            defer srv.release(prepared.preparing, prepared.request);
++            try t.expectEqual(@as(u32, @intCast(if (i == 2) 0 else default)), prepared.request.think_budget);
++        }
++    }
++}
