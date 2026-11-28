@@ -1,0 +1,641 @@
+diff --git a/zig/build/cuda_server_host.zig b/zig/build/cuda_server_host.zig
+--- a/zig/build/cuda_server_host.zig
++++ b/zig/build/cuda_server_host.zig
+@@ -14,6 +14,7 @@
+         .link_libc = true,
+         .imports = &.{ .{ .name = "engine_api", .module = native_modules.api }, .{ .name = "tokenizer", .module = mods.tokenizer }, .{ .name = "template", .module = template }, .{ .name = "living", .module = mods.living }, .{ .name = "core", .module = mods.core } },
+     });
++    b.step("test-inkling-mini-host", "Mini-only direct answer preparation and chat protocol").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"Inkling Mini off:"} })).step);
+     const server_json = @import("server.zig").addTo(b, server_tests, host, .debug);
+     b.step("test-responses-owner-host", "Stored and running Responses stay with their creating API key").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{ "Responses owner:", "a whole response keeps", "the cancel route's path", "a held name", "with API keys only", "auth scopes:" } })).step);
+     const owner_socket = b.addTest(.{ .root_module = server_tests, .filters = &.{"Responses owner socket:"} });
+diff --git a/zig/src/server/model_text.zig b/zig/src/server/model_text.zig
+--- a/zig/src/server/model_text.zig
++++ b/zig/src/server/model_text.zig
+@@ -146,6 +146,8 @@
+ };
+
+ pub const Text = struct {
++    /// Checkpoint model_type inkling2_loop; shared Inkling markers alone never enable Mini policy.
++    inkling2_mini: bool = false,
+     native_deepseek: bool = false,
+     /// The chat template renders ``defer_loading`` and ``tool_reference`` itself (deferred_tools.zig).
+     deferred_native: bool = false,
+diff --git a/zig/src/server/hf_text.zig b/zig/src/server/hf_text.zig
+--- a/zig/src/server/hf_text.zig
++++ b/zig/src/server/hf_text.zig
+@@ -32,6 +32,7 @@
+     native_kimi: ?*KimiText = null,
+     source: []const u8 = "",
+     native_deepseek: bool = false,
++    inkling2_mini: bool = false,
+     inkling: bool = false, // the tokenizer holds Inkling 2's block markers: replies read as .inkling
+     schema_prompt: bool = true, // TF_DSV41_SCHEMA_PROMPT: response_format's schema as the encoder's ``## Response Format``
+     overridden: bool = false, // the chat template is --chat-template's file
+@@ -96,6 +97,7 @@
+             return error.Load;
+         };
+         if (model_config == .object) if (model_config.object.get("model_type")) |kind| {
++            t.inkling2_mini = kind == .string and std.mem.eql(u8, kind.string, "inkling2_loop");
+             t.native_deepseek = template_override == null and kind == .string and
+                 (std.mem.eql(u8, kind.string, "deepseek_v4") or std.mem.eql(u8, kind.string, "deepseek_v41"));
+             if (kind == .string and std.mem.eql(u8, kind.string, "glm5_next")) {
+@@ -290,7 +292,7 @@
+
+     pub fn text(t: *HfText) model_text.Text {
+         if (t.native_kimi) |kimi| return kimi.text();
+-        return .{ .native_deepseek = t.native_deepseek and t.compiled == null, .deferred_native = @import("deferred_tools.zig").native(if (t.tool_source.len > 0) t.tool_source else t.source), .ctx = t, .vtable = if (t.inkling) &comptime table(.inkling) else &comptime table(.template) };
++        return .{ .inkling2_mini = t.inkling2_mini, .native_deepseek = t.native_deepseek and t.compiled == null, .deferred_native = @import("deferred_tools.zig").native(if (t.tool_source.len > 0) t.tool_source else t.source), .ctx = t, .vtable = if (t.inkling) &comptime table(.inkling) else &comptime table(.template) };
+     }
+
+     fn table(comptime format: model_text.Text.Format) model_text.Text.VTable {
+diff --git a/zig/src/server/prompt.zig b/zig/src/server/prompt.zig
+--- a/zig/src/server/prompt.zig
++++ b/zig/src/server/prompt.zig
+@@ -7,6 +7,7 @@
+ const model_text = @import("model_text.zig");
+ const chat = @import("chat.zig");
+ const images = @import("images.zig");
++const mini = @import("inkling_mini.zig");
+ const Server = @import("server.zig").Server;
+ const Value = json.Value;
+ const Cx = errors.Cx;
+@@ -49,7 +50,7 @@
+         .tools = if (tools.len > 0) Value{ .array = @constCast(tools) } else null,
+         .add_generation_prompt = generation,
+         .enable_thinking = thinking,
+-        .reasoning_effort = if (thinking) effort else cx.named_effort orelse srv.off_effort,
++        .reasoning_effort = if (mini.off(srv, thinking)) "none" else if (thinking) effort else cx.named_effort orelse srv.off_effort,
+         .clear_thinking = cx.clear_thinking,
+         .tool_choice = cx.template_fields.get("tool_choice"),
+         .response_format = cx.template_fields.get("response_format"),
+@@ -62,6 +63,7 @@
+     };
+     var ids = rendered.ids;
+     var closed = rendered.closed;
++    if (mini.off(srv, thinking) and generation) return mini.prefix(srv, cx, tools, ids);
+     // MiniMax-M3 thinks adaptively: with thinking off, its reply begins after the `</mm:think>` the prompt ends with
+     if (!thinking and generation and std.mem.eql(u8, srv.markers.close, @import("reply_text.zig").mm_markers.close)) {
+         if (srv.text.tokenId(srv.markers.close)) |close| return try std.mem.concat(cx.a, u32, &.{ ids, &.{close} });
+@@ -128,7 +130,9 @@
+     try user.put(cx.a, "content", .{ .string = "x" });
+     const list = try cx.a.alloc(Value, 1);
+     list[0] = .{ .object = user };
+-    const with = try renderIds(srv, cx, .{ .array = list }, &.{}, thinking, null, true);
++    var with = try renderIds(srv, cx, .{ .array = list }, &.{}, thinking, null, true);
++    // Reply spans describe the template itself, not Mini's request-only assistant prefill.
++    if (mini.off(srv, thinking)) with = with[0 .. with.len - 2];
+     const without = try renderIds(srv, cx, .{ .array = list }, &.{}, thinking, null, false);
+     if (without.len >= with.len or !std.mem.eql(u32, with[0..without.len], without)) return &.{};
+     return with[without.len..];
+diff --git a/zig/src/server/server.zig b/zig/src/server/server.zig
+--- a/zig/src/server/server.zig
++++ b/zig/src/server/server.zig
+@@ -365,10 +365,11 @@
+         // Inkling 2's chat replies are blocks: its grammars frame the payload in them, from the reply's first token
+         const inkling = srv.text.vtable.format == .inkling;
+         const inkling_chat = inkling and chat;
++        const direct = chat and @import("inkling_mini.zig").off(srv, @import("fields.zig").flag(f, "enable_thinking") orelse srv.config.enable_thinking);
+         if (has_tools and required) {
+             if (!srv.info.capability(.structures)) return cx.fail(.request, "backend '{s}' cannot enforce tool_choice \"required\" or a named function: it has no token grammar support; send \"auto\" or \"none\"", .{srv.backendName()});
+             if (inkling) {
+-                const text = try inkling_structure.calls(srv, cx, tools, !one_call, true);
++                const text = try inkling_structure.callsFrom(srv, cx, tools, !one_call, true, direct, false);
+                 if (text.len > grammar.max_text) return cx.fail(.request, "tools: the tools' names and schemas make a {d}-byte grammar, more than the {d} KiB a grammar may be", .{ text.len, grammar.max_text / 1024 });
+                 const reason = try std.fmt.allocPrint(cx.a, "tool_choice \"required\" or a named function on backend '{s}'", .{srv.backendName()});
+                 var st = try srv.compiledStructure(cx, .structural_tag, text, reason, false);
+@@ -383,21 +384,20 @@
+             if (!srv.info.capability(.structures)) return cx.refuse("structured output (response_format and the guided_* fields) is not supported by this engine yet");
+             if (s.text.len > grammar.max_text) return cx.fail(.request, "{s}: the grammar is {d} bytes, more than the {d} KiB a grammar may be", .{ s.field, s.text.len, grammar.max_text / 1024 });
+             const st = if (inkling_chat and s.kind != .structural_tag)
+-                try srv.compiledStructure(cx, .structural_tag, try inkling_structure.framed(srv, cx, s), s.field, false)
++                try srv.compiledStructure(cx, .structural_tag, try inkling_structure.framedFrom(srv, cx, s, direct), s.field, false)
+             else
+                 try srv.compiledStructure(cx, s.kind, s.text, s.field, thinking and !inkling_chat);
+             if (request.structure) |tool| tool.free();
+             request.structure = st;
+         }
++        if (direct) try inkling_structure.optionalDirect(srv, cx, tools, !one_call, all, request);
+         try budgetStructure(cx, f, request);
+     }
+-
+     /// Give back a request's preparing count, and its grammar once the engine is done with it (or it was never sent).
+     pub fn release(srv: *Server, preparing: bool, request: ?api.Request) void {
+         if (preparing) _ = srv.preparing.fetchSub(1, .acq_rel);
+         if (request) |r| if (r.structure) |st| st.free();
+     }
+-
+     /// A request's grammar, compiled once here and handed to the engine (a 400 with xgrammar's reason if it cannot be).
+     pub fn compiledStructure(srv: *Server, cx: *Cx, kind: grammar.Kind, text: []const u8, field: []const u8, thinking: bool) errors.Refused!api.Structure {
+         const c = srv.grammarCompiler() orelse return cx.fail(.request, "{s}: {s}", .{ if (kind == .structural_tag) field else "structured output", srv.grammar_problem.? });
+diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
+--- a/zig/src/server/chat.zig
++++ b/zig/src/server/chat.zig
+@@ -156,7 +156,7 @@
+     const io = srv.io;
+     const received = nowNs(io);
+     const f = input.fields;
+-    const stops_opt = try fields_mod.stopOptions(cx, f);
++    var stops_opt = try fields_mod.stopOptions(cx, f);
+     var limit: i64 = @max(1, if (input.max_tokens) |m| (if (m != 0) m else srv.config.default_max_tokens) else srv.config.default_max_tokens);
+     const priority = f.get("priority");
+     const background = prompt_mod.isTitle(input.messages, input.tools.len > 0) or
+@@ -167,10 +167,12 @@
+     errdefer srv.release(preparing, null);
+     if (gone.check()) return error.Cancelled;
+     const thinking = input.prompt == null and (fields_mod.flag(f, "enable_thinking") orelse srv.config.enable_thinking);
++    const direct = input.prompt == null and @import("inkling_mini.zig").off(srv, thinking);
++    if (direct) stops_opt.ignore_eos = false;
+     const instruct = input.prompt == null and !thinking and !input.own; // a client's chat with thinking off may take --instruct-sampling's set
+     const reasoning = thinking and srv.info.capability(.reasoning) and (srv.text.vtable.format != .kimi or input.prompt == null); // the prompt renders `thinking`; the reply reads `reasoning`
+     const asked = if (f.get("reasoning_effort")) |e| (if (e == .string) e.string else null) else null;
+-    const effort = srv.effortFor(asked);
++    const effort: ?[]const u8 = if (direct) "none" else srv.effortFor(asked);
+     cx.named_effort = if (input.prompt == null) fields_mod.namedEffort(asked, srv.effort_levels) else null; // a raw prompt has no template
+     cx.clear_thinking = fields_mod.flag(f, "clear_thinking");
+     cx.template_fields = f;
+@@ -215,9 +217,11 @@
+         .images = rendered.images,
+         .cache_key = rendered.cache_key,
+     };
+-    try srv.checkFeatures(cx, f, input.tools.len > 0, reasoning, input.chat_route, rendered.ids, input.tools, &request);
++    try srv.checkFeatures(cx, f, input.tools.len > 0, reasoning, input.chat_route or direct, rendered.ids, input.tools, &request);
+     server_mod.nameStructure(input.format, &request);
+     errdefer srv.release(false, request);
++    if (direct)
++        try @import("inkling_mini.zig").finish(srv, cx, input.tools, &request);
+     if (reasoning) {
+         const budget_field = f.get("thinking_budget");
+         const budget: i64 = if (budget_field != null and budget_field.?.truthy()) budget_field.?.int64() orelse 0 else srv.config.thinking_budget;
+@@ -288,7 +292,7 @@
+     };
+     srv.release(preparing, null); // a background request waits only while a foreground one prepares
+     preparing = false;
+-    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .asked = input.cancel, .reply_id = input.id, .seed = if (request.sampling) |v| v.seed else null, .sink = sink, .thinking = prepared.reasoning or (srv.text.vtable.format != .kimi and srv.info.capability(.reasoning) and reply_text.isChannel(srv.markers)), .chat = input.prompt == null, .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .token_ids = prepared.token_ids, .lp = if (request.logprobs != null) .{ .positions = if (sink) |s| s.tokens != null else false } else null, .loop_stop = request.loop_stop, .single = fields_mod.flag(input.fields, "tool_call_single") orelse false, .required = fields_mod.flag(input.fields, "tool_call_required") orelse false, .recover = input.prompt == null and request.structure == null, .deadline_ns = prepared.deadline_ns };
++    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .asked = input.cancel, .reply_id = input.id, .seed = if (request.sampling) |v| v.seed else null, .sink = sink, .thinking = prepared.reasoning or (srv.text.vtable.format != .kimi and srv.info.capability(.reasoning) and reply_text.isChannel(srv.markers)), .chat = input.prompt == null, .prefilled_text = input.prompt == null and @import("inkling_mini.zig").off(srv, prepared.thinking) and try @import("inkling_mini.zig").textStart(cx, input.tools), .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .token_ids = prepared.token_ids, .lp = if (request.logprobs != null) .{ .positions = if (sink) |s| s.tokens != null else false } else null, .loop_stop = request.loop_stop, .single = fields_mod.flag(input.fields, "tool_call_single") orelse false, .required = fields_mod.flag(input.fields, "tool_call_required") orelse false, .recover = input.prompt == null and request.structure == null, .deadline_ns = prepared.deadline_ns };
+     defer srv.noteRequest(prepared.prompt_len, cached_tokens.within(box.cached, prepared.prompt_len), gen.collected.items.len, box.stats.drafted, box.stats.accepted, box.stats.rounds, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds, if (box.stats.prefill_seconds != null) box.stats.queued_seconds else null);
+     errdefer if (!gen.engine_done) gen.cancel(); // the engine writes to the mailbox until it says finished
+     if (srv.recipients and input.prompt == null) gen.recipient = try recipient_reply.Reading.of(a, srv.text, request.prompt, input.tools, prepared.reasoning);
+diff --git a/zig/src/server/chat_generation.zig b/zig/src/server/chat_generation.zig
+--- a/zig/src/server/chat_generation.zig
++++ b/zig/src/server/chat_generation.zig
+@@ -49,6 +49,7 @@
+     sink: ?Sink,
+     thinking: bool,
+     chat: bool = true,
++    prefilled_text: bool = false, // Mini off: model/text are in the prompt, not the generated ids
+     stops: reply_text.Stops,
+     ignore_eos: bool,
+     max_tokens: u32,
+diff --git a/zig/src/server/chat_inkling.zig b/zig/src/server/chat_inkling.zig
+--- a/zig/src/server/chat_inkling.zig
++++ b/zig/src/server/chat_inkling.zig
+@@ -10,7 +10,9 @@
+ pub fn read(g: anytype, ids: []const u32, finished: bool) std.mem.Allocator.Error!Result {
+     const raw = try g.srv.text.decode(g.a, ids);
+     if (!g.chat) return .{ .content = g.stops.visible(raw, !finished), .reasoning = "", .calls = null, .reasoning_tokens = 0 };
+-    const r = try split.split(g.a, raw, finished, g.tools); // the request's tools, narrowed by tool_choice
++    var reader: split.Stream = .{ .a = g.a, .offered = g.tools, .state = if (g.prefilled_text) .content else .header };
++    try reader.feed(raw, false);
++    const r = try reader.result(raw, finished); // the request's tools, narrowed by tool_choice
+     var calls: ?[]Value = null; // a raw completion stays unsplit above; a reply a stop string ended keeps no calls
+     if (r.calls.len > 0 and g.stops.matched(raw) == null) {
+         const list = try g.a.alloc(Value, r.calls.len); // no ids: the model writes none (openai_calls.zig keys them)
+@@ -37,7 +39,7 @@
+ pub fn stream(g: anytype, sink: chat.Sink) chat.Failure!void {
+     const all = g.visible.text.items; // the reply's decode so far, append-only (chat_generation.zig decodes it)
+     if (!g.chat) return @import("chat_kimi.zig").emitDeltas(g, sink, .{ .content = g.stops.visible(all, true), .reasoning = "", .calls = null, .reasoning_tokens = 0 }, true);
+-    if (g.inkling == null) g.inkling = .{ .a = g.a, .offered = g.tools };
++    if (g.inkling == null) g.inkling = .{ .a = g.a, .offered = g.tools, .state = if (g.prefilled_text) .content else .header };
+     const s = &g.inkling.?;
+     try s.feed(all, true);
+     const r = try s.result(all, false);
+diff --git a/zig/src/server/inkling_structure.zig b/zig/src/server/inkling_structure.zig
+--- a/zig/src/server/inkling_structure.zig
++++ b/zig/src/server/inkling_structure.zig
+@@ -22,10 +22,10 @@
+
+ /// Every framing token (vLLM INKLING_CONTROL_TOKENS): free text in a grammar never spells one.
+ const control = [_][]const u8{
+-    "<|endoftext|>",              "<|message_user|>",           "<|message_system|>",   "<|message_tool|>",
+-    "<|content_image|>",          "<|content_xml|>",            "<|content_audio_input|>", "<|audio_end|>",
+-    markers.model,                markers.text,                 markers.thinking,       markers.tool_json,
+-    markers.tool_text,            markers.tool_error,           markers.end_sampling,   markers.end,
++    "<|endoftext|>",     "<|message_user|>", "<|message_system|>",      "<|message_tool|>",
++    "<|content_image|>", "<|content_xml|>",  "<|content_audio_input|>", "<|audio_end|>",
++    markers.model,       markers.text,       markers.thinking,          markers.tool_json,
++    markers.tool_text,   markers.tool_error, markers.end_sampling,      markers.end,
+ };
+
+ /// vLLM's sentence for a tool_choice (null: none to add). `choice` is the request's tool_choice; `parallel` its
+@@ -157,14 +157,19 @@
+ /// The structural tag (xgrammar JSON) for a grammar request on an Inkling chat reply: thinking blocks, then one
+ /// text block holding the asked-for output, then the end of sampling (xgrammar's stop tokens).
+ pub fn framed(srv: *Server, cx: *Cx, s: grammar.Spec) errors.Refused![]const u8 {
++    return framedFrom(srv, cx, s, false);
++}
++
++/// Mini off already put model/text in the prompt.
++pub fn framedFrom(srv: *Server, cx: *Cx, s: grammar.Spec, direct: bool) errors.Refused![]const u8 {
+     const a = cx.a;
+     const elements = try a.dupe(Value, &.{ try thinking(srv, cx), try token(srv, cx, markers.model), try token(srv, cx, markers.text), try inner(cx, s), try token(srv, cx, markers.end) });
+-    return tag(a, try node(a, "sequence", &.{.{ "elements", .{ .array = elements } }}));
++    return tag(a, try node(a, "sequence", &.{.{ "elements", .{ .array = if (direct) elements[3..] else elements } }}));
+ }
+
+ /// One tool block for `tool`: `<|message_model|>NAME<|content_invoke_tool_json|>{"name":NAME,"args":ARGS}<|end_message|>`,
+ /// ARGS in the tool's schema when strict (or `all`), else any object; the schema keeps its own root ($ref, $defs).
+-fn callBlock(srv: *Server, cx: *Cx, tool: Value, all: bool) errors.Refused!Value {
++fn callBlock(srv: *Server, cx: *Cx, tool: Value, all: bool, leading_model: bool) errors.Refused!Value {
+     const a = cx.a;
+     const name = try tool_specs.toolName(a, tool);
+     const quoted = try json.stringify(a, .{ .string = name }, .{ .ascii = false });
+@@ -178,18 +183,45 @@
+         try constant(a, "}"),
+         try token(srv, cx, markers.end),
+     });
+-    return node(a, "sequence", &.{.{ "elements", .{ .array = elements } }});
++    return node(a, "sequence", &.{.{ "elements", .{ .array = if (leading_model) elements else elements[1..] } }});
+ }
+
+ /// The structural tag for a reply that must call one of `tools` (a named choice offers one): thinking blocks, then
+ /// one call, or (`parallel`) one or more, then the end of sampling.
+ pub fn calls(srv: *Server, cx: *Cx, tools: []const Value, parallel: bool, all: bool) errors.Refused![]const u8 {
+-    const a = cx.a;
+-    const blocks = try a.alloc(Value, tools.len);
+-    for (tools, blocks) |tool, *b| b.* = try callBlock(srv, cx, tool, all);
+-    const one = if (blocks.len == 1) blocks[0] else try node(a, "or", &.{.{ "elements", .{ .array = blocks } }});
+-    const body = if (parallel) try node(a, "plus", &.{.{ "content", one }}) else one;
+-    return tag(a, try node(a, "sequence", &.{.{ "elements", .{ .array = try a.dupe(Value, &.{ try thinking(srv, cx), body }) } }}));
++    return callsFrom(srv, cx, tools, parallel, all, false, false);
++}
++
++fn callSet(srv: *Server, cx: *Cx, tools: []const Value, all: bool, leading_model: bool) errors.Refused!Value {
++    const blocks = try cx.a.alloc(Value, tools.len);
++    for (tools, blocks) |tool, *b| b.* = try callBlock(srv, cx, tool, all, leading_model);
++    return if (blocks.len == 1) blocks[0] else node(cx.a, "or", &.{.{ "elements", .{ .array = blocks } }});
++}
++
++/// `direct` prefilled only the first model token. Later parallel calls still need their own model header.
++pub fn callsFrom(srv: *Server, cx: *Cx, tools: []const Value, parallel: bool, all: bool, direct: bool, optional: bool) errors.Refused![]const u8 {
++    const a = cx.a;
++    const one = try callSet(srv, cx, tools, all, true);
++    if (!direct) {
++        const body = if (parallel) try node(a, "plus", &.{.{ "content", one }}) else one;
++        return tag(a, try node(a, "sequence", &.{.{ "elements", .{ .array = try a.dupe(Value, &.{ try thinking(srv, cx), body }) } }}));
++    }
++    const first = try callSet(srv, cx, tools, all, false);
++    const body = if (parallel) try node(a, "sequence", &.{.{ "elements", .{ .array = try a.dupe(Value, &.{ first, try node(a, "star", &.{.{ "content", one }}) }) } }}) else first;
++    if (!optional) return tag(a, body);
++    var excludes: std.ArrayList(Value) = .empty;
++    for (control) |c| if (srv.text.tokenId(c) != null) try excludes.append(a, .{ .string = c });
++    const text = try node(a, "any_text", &.{.{ "excludes", .{ .array = excludes.items } }});
++    const answer = try node(a, "sequence", &.{.{ "elements", .{ .array = try a.dupe(Value, &.{ try token(srv, cx, markers.text), text, try token(srv, cx, markers.end) }) } }});
++    return tag(a, try node(a, "or", &.{.{ "elements", .{ .array = try a.dupe(Value, &.{ answer, body }) } }}));
++}
++
++/// Auto tools need a choice between a text header and a function name, rather than a thinking header.
++pub fn optionalDirect(srv: *Server, cx: *Cx, tools: []const Value, parallel: bool, all: bool, request: *@import("engine_api").Request) errors.Refused!void {
++    if (tools.len == 0 or request.structure != null or try @import("inkling_mini.zig").textStart(cx, tools)) return;
++    const text = try callsFrom(srv, cx, tools, parallel, all, true, true);
++    if (text.len > grammar.max_text) return cx.refuse("tools: Mini direct reply grammar exceeds the size limit");
++    request.structure = try srv.compiledStructure(cx, .structural_tag, text, "tool_choice", false);
+ }
+
+ const testing = std.testing;
+diff --git a/zig/src/server/inkling_route_test.zig b/zig/src/server/inkling_route_test.zig
+--- a/zig/src/server/inkling_route_test.zig
++++ b/zig/src/server/inkling_route_test.zig
+@@ -16,9 +16,10 @@
+ const specials = [_][]const u8{ markers.model, markers.text, markers.thinking, markers.end, markers.end_sampling, markers.tool_json };
+
+ /// Bytes as tokens plus Inkling 2's markers as whole tokens, read as the .inkling format.
+-const Text = struct {
+-    fn text(x: *Text) model_text.Text {
+-        return .{ .ctx = x, .vtable = &.{ .format = .inkling, .encode = preflight.TestText.encode, .decode = decode, .token_id = tokenId, .token_string = tokenString, .vocab_size = vocabSize, .eos_ids = eosIds, .render = render, .template_source = templateSource } };
++pub const Text = struct {
++    mini: bool = false,
++    pub fn text(x: *Text) model_text.Text {
++        return .{ .inkling2_mini = x.mini, .ctx = x, .vtable = &.{ .format = .inkling, .encode = preflight.TestText.encode, .decode = decode, .token_id = tokenId, .token_string = tokenString, .vocab_size = vocabSize, .eos_ids = eosIds, .render = render, .template_source = templateSource } };
+     }
+     /// A character the ids end inside reads as U+FFFD, as a byte-level tokenizer's decode reads it.
+     fn decode(_: *anyopaque, a: A, ids: []const u32) A.Error![]u8 {
+@@ -58,7 +59,7 @@
+ const reply_parts = [_][]const u8{ markers.thinking, "Need the files.", markers.end, markers.model, "run_shell_command", markers.tool_json, payload, markers.end, markers.end_sampling };
+
+ /// A scripted reply as ids: each marker one token, every other byte its own.
+-fn script(a: A, parts: []const []const u8) ![]const u32 {
++pub fn script(a: A, parts: []const []const u8) ![]const u32 {
+     var out: std.ArrayList(u32) = .empty;
+     for (parts) |p| if (Text.tokenId(undefined, p)) |id| try out.append(a, id) else for (p) |b| try out.append(a, b);
+     return out.items;
+@@ -89,17 +90,17 @@
+     }
+ };
+
+-const Wire = struct {
++pub const Wire = struct {
+     a: A,
+     bytes: std.ArrayList(u8) = .empty,
+-    fn write(p: *anyopaque, bytes: []const u8) error{Closed}!void {
++    pub fn write(p: *anyopaque, bytes: []const u8) error{Closed}!void {
+         const w: *@This() = @ptrCast(@alignCast(p));
+         w.bytes.appendSlice(w.a, bytes) catch return error.Closed;
+     }
+ };
+
+ /// What a chat client read: its calls (id, name, arguments), reasoning, content and last finish_reason.
+-const Got = struct {
++pub const Got = struct {
+     ids: std.ArrayList([]const u8) = .empty,
+     names: std.ArrayList(u8) = .empty,
+     arguments: std.ArrayList(u8) = .empty,
+@@ -107,7 +108,7 @@
+     content: std.ArrayList(u8) = .empty,
+     finish: []const u8 = "",
+
+-    fn keep(g: *Got, a: A, choice: json.Value, part: []const u8) !void {
++    pub fn keep(g: *Got, a: A, choice: json.Value, part: []const u8) !void {
+         if (choice.strField("finish_reason")) |f| g.finish = f;
+         if (choice.strField("text")) |x| try g.content.appendSlice(a, x);
+         const m = choice.get(part) orelse return;
+diff --git a/zig/src/server/hf_eos_test.zig b/zig/src/server/hf_eos_test.zig
+--- a/zig/src/server/hf_eos_test.zig
++++ b/zig/src/server/hf_eos_test.zig
+@@ -68,3 +68,27 @@
+         try std.testing.expectEqual(c.want, t.text().vtable.format);
+     }
+ }
++
++test "Inkling Mini off: checkpoint metadata distinguishes Mini from shared Inkling format and aliases" {
++    const a = std.testing.allocator;
++    const io = std.testing.io;
++    var tmp = std.testing.tmpDir(.{});
++    defer tmp.cleanup();
++    const dir = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
++    defer a.free(dir);
++    const markers = @import("inkling_reply.zig").markers;
++    const tok = "{\"model\":{\"type\":\"BPE\",\"vocab\":{\"H\":0},\"merges\":[]},\"added_tokens\":[" ++
++        "{\"id\":1,\"content\":\"" ++ markers.model ++ "\",\"special\":true}," ++
++        "{\"id\":2,\"content\":\"" ++ markers.end_sampling ++ "\",\"special\":true}]}";
++    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = tok });
++    for ([_][]const u8{ "inkling2_loop", "inkling2", "inkling2_small", "unrelated" }) |kind| {
++        const config = try std.fmt.allocPrint(a, "{{\"model_type\":\"{s}\"}}", .{kind});
++        defer a.free(config);
++        try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = config });
++        var problem: []const u8 = "";
++        const hf = try HfText.load(a, io, dir, null, a, &problem);
++        defer hf.deinit();
++        try std.testing.expectEqual(@import("model_text.zig").Text.Format.inkling, hf.text().vtable.format);
++        try std.testing.expectEqual(std.mem.eql(u8, kind, "inkling2_loop"), hf.text().inkling2_mini);
++    }
++}
+diff --git a/zig/src/server/root.zig b/zig/src/server/root.zig
+--- a/zig/src/server/root.zig
++++ b/zig/src/server/root.zig
+@@ -72,6 +72,7 @@
+     _ = @import("tool_minimax.zig");
+     _ = @import("inkling_reply.zig");
+     _ = @import("inkling_route_test.zig");
++    _ = @import("inkling_mini_test.zig");
+     _ = @import("tool_stream.zig");
+     _ = @import("tool_params.zig");
+     _ = @import("tool_grammar.zig");
+diff --git a/zig/src/server/inkling_mini.zig b/zig/src/server/inkling_mini.zig
+new file mode 100644
+--- /dev/null
++++ b/zig/src/server/inkling_mini.zig
+@@ -0,0 +1,33 @@
++//! Direct generation starts for thinking-off on the inkling2_loop checkpoint only.
++const std = @import("std");
++const api = @import("engine_api");
++const errors = @import("errors.zig");
++const grammar = @import("grammar.zig");
++const markers = @import("inkling_reply.zig").markers;
++const Server = @import("server.zig").Server;
++const Value = @import("json").Value;
++const Cx = errors.Cx;
++
++pub fn off(srv: *const Server, thinking: bool) bool {
++    return !thinking and srv.text.inkling2_mini and srv.text.vtable.format == .inkling;
++}
++
++/// Text/JSON starts inside content; tools start inside a model header so a function name can follow.
++pub fn textStart(cx: *Cx, tools: []const Value) errors.Refused!bool {
++    return tools.len == 0 or try grammar.spec(cx, cx.template_fields) != null;
++}
++
++pub fn prefix(srv: *Server, cx: *Cx, tools: []const Value, ids: []const u32) errors.Refused![]const u32 {
++    const model = srv.text.tokenId(markers.model) orelse return cx.refuse("Mini direct reply needs a model token");
++    if (!try textStart(cx, tools)) return std.mem.concat(cx.a, u32, &.{ ids, &.{model} });
++    const text = srv.text.tokenId(markers.text) orelse return cx.refuse("Mini direct reply needs a text token");
++    return std.mem.concat(cx.a, u32, &.{ ids, &.{ model, text } });
++}
++
++/// End a free-text answer at its block boundary, before the model can open a second thinking block.
++pub fn finish(srv: *Server, cx: *Cx, tools: []const Value, request: *api.Request) errors.Refused!void {
++    if (!try textStart(cx, tools)) return;
++    const end = srv.text.tokenId(markers.end) orelse return cx.refuse("Mini direct reply needs an end token");
++    if (std.mem.indexOfScalar(u32, request.eos, end) == null)
++        request.eos = try std.mem.concat(cx.a, u32, &.{ request.eos, &.{end} });
++}
+diff --git a/zig/src/server/inkling_mini_test.zig b/zig/src/server/inkling_mini_test.zig
+new file mode 100644
+--- /dev/null
++++ b/zig/src/server/inkling_mini_test.zig
+@@ -0,0 +1,195 @@
++//! Mini-only direct-answer integration through actual request preparation and whole/SSE reply parsing.
++const std = @import("std");
++const api = @import("engine_api");
++const server = @import("root.zig");
++const json = server.json;
++const fixture = @import("inkling_route_test.zig");
++const Conn = @import("http_conn.zig").Conn;
++const t = std.testing;
++const A = std.mem.Allocator;
++
++const Backend = struct {
++    tokens: []const u32,
++    request: ?api.Request = null,
++    committed: usize = 0,
++    fn engine(e: *Backend) api.Engine {
++        return .{ .ctx = e, .vtable = &.{ .info = info, .submit = submit, .cancel = cancel, .status = status, .memory = memory } };
++    }
++    fn info(_: *anyopaque) api.Info {
++        return .{ .context_window = 4096 };
++    }
++    fn submit(p: *anyopaque, id: api.Id, request: *const api.Request, sink: api.Sink) api.SubmitError!void {
++        const e: *Backend = @ptrCast(@alignCast(p));
++        e.request = request.*;
++        sink.event(sink.ctx, id, &.{ .prefilled = 0 });
++        for (e.tokens) |token| {
++            sink.event(sink.ctx, id, &.{ .tokens = &.{token} });
++            e.committed += 1;
++            if (std.mem.indexOfScalar(u32, request.eos, token) != null) break;
++        }
++        sink.event(sink.ctx, id, &.{ .finished = .{ .reason = .stop } });
++    }
++    fn cancel(_: *anyopaque, _: api.Id) void {}
++    fn status(_: *anyopaque, out: *api.Status, _: []u32) void {
++        out.* = .{};
++    }
++    fn memory(_: *anyopaque, _: bool) ?api.Memory {
++        return null;
++    }
++};
++
++fn run(a: A, mini: bool, stream: bool, raw: bool, fields: []const u8, parts: []const []const u8) !struct { got: fixture.Got, request: api.Request, committed: usize } {
++    var backend: Backend = .{ .tokens = try fixture.script(a, parts) };
++    var text: fixture.Text = .{ .mini = mini };
++    const srv = try server.Server.init(t.allocator, t.io, backend.engine(), text.text(), .{ .served_name = "any-alias", .model_ids = &.{"any-alias"}, .enable_thinking = true, .use_drafts = false }, null);
++    defer srv.deinit();
++    const body = try std.mem.concat(a, u8, &.{ "{\"model\":\"any-alias\",\"max_tokens\":100,", if (raw) "\"prompt\":\"raw\"" else "\"messages\":[{\"role\":\"user\",\"content\":\"Reply briefly.\"}]", ",\"stream\":", if (stream) "true" else "false", fields, "}" });
++    var wire: fixture.Wire = .{ .a = a };
++    var headers = [_]@import("http_conn.zig").Header{.{ .name = "Content-Length", .value = try std.fmt.allocPrint(a, "{d}", .{body.len}) }};
++    var conn: Conn = .{ .fd = -1, .peer = "", .buf = try a.dupe(u8, body), .end = body.len, .gpa = a, .version = "HTTP/1.1", .method = "POST", .path = "", .headers = &headers, .write_hooks = .{ .ctx = &wire, .write = fixture.Wire.write } };
++    @import("openai.zig").post(srv, &conn, a, !raw);
++    const bytes = wire.bytes.items;
++    try t.expect(std.mem.startsWith(u8, bytes, "HTTP/1.1 200 "));
++    var got: fixture.Got = .{};
++    var frames: std.ArrayList([]const u8) = .empty;
++    if (stream) {
++        var at: usize = 0;
++        while (std.mem.indexOfPos(u8, bytes, at, "data: ")) |d| {
++            const end = std.mem.indexOfPos(u8, bytes, d, "\n\n") orelse bytes.len;
++            if (!std.mem.eql(u8, bytes[d + 6 .. end], "[DONE]")) try frames.append(a, bytes[d + 6 .. end]);
++            at = end;
++        }
++    } else try frames.append(a, bytes[(std.mem.indexOf(u8, bytes, "\r\n\r\n") orelse return error.NoBody) + 4 ..]);
++    for (frames.items) |frame| {
++        const choices = ((try json.parse(a, frame)).ok.get("choices") orelse continue).items() orelse continue;
++        if (choices.len > 0) try got.keep(a, choices[0], if (stream) "delta" else "message");
++    }
++    return .{ .got = got, .request = backend.request orelse return error.NotSubmitted, .committed = backend.committed };
++}
++
++const off = ",\"chat_template_kwargs\":{\"enable_thinking\":false},\"reasoning_effort\":\"high\"";
++
++test "Inkling Mini off: actual prompt enters text, first answer ends generation, whole and SSE" {
++    var arena = std.heap.ArenaAllocator.init(t.allocator);
++    defer arena.deinit();
++    for ([_]bool{ false, true }) |stream| {
++        const r = try run(arena.allocator(), true, stream, false, off, &.{ "Answer.", "<|end_message|>", "<|message_model|>", "<|content_thinking|>", "Unwanted continuation." });
++        try t.expect(std.mem.endsWith(u32, r.request.prompt, &.{ 256, 257 }));
++        try t.expectEqual(@as(usize, 8), r.committed);
++        try t.expect(r.request.structure == null);
++        try t.expectEqualStrings("Answer.", r.got.content.items);
++        try t.expectEqualStrings("", r.got.reasoning.items);
++    }
++}
++
++test "Inkling Mini off: on and other Inkling checkpoints keep their prompt and reasoning path" {
++    var arena = std.heap.ArenaAllocator.init(t.allocator);
++    defer arena.deinit();
++    for ([_]bool{ false, true }) |stream| for ([_]bool{ false, true }) |mini| {
++        const r = try run(arena.allocator(), mini, stream, false, if (mini) "" else off, &.{ "<|message_model|>", "<|content_thinking|>", "Consider.", "<|end_message|>", "<|message_model|>", "<|content_text|>", "Answer.", "<|end_message|>" });
++        try t.expectEqualSlices(u32, &.{ 'p', 'r', 'o', 'm', 'p', 't' }, r.request.prompt);
++        try t.expectEqual(@as(usize, 0), r.request.eos.len);
++        try t.expectEqualStrings("Consider.", r.got.reasoning.items);
++        try t.expectEqualStrings("Answer.", r.got.content.items);
++    };
++}
++
++test "Inkling Mini off: off wins over ignore_eos, raw and on retain caller termination control" {
++    var arena = std.heap.ArenaAllocator.init(t.allocator);
++    defer arena.deinit();
++    for ([_]bool{ false, true }) |stream| {
++        const raw = try run(arena.allocator(), true, stream, true, off ++ ",\"ignore_eos\":true", &.{ "A", "<|end_message|>", "B" });
++        try t.expectEqual(@as(usize, 3), raw.committed);
++        try t.expectEqual(@as(usize, 0), raw.request.eos.len);
++        try t.expectEqualStrings("A<|end_message|>B", raw.got.content.items);
++        try t.expectEqualSlices(u32, &.{ 'r', 'a', 'w' }, raw.request.prompt);
++        const on = try run(arena.allocator(), true, stream, false, ",\"ignore_eos\":true", &.{ "A", "<|end_message|>", "B" });
++        try t.expectEqual(@as(usize, 3), on.committed);
++        try t.expectEqual(@as(usize, 0), on.request.eos.len);
++        const disabled = try run(arena.allocator(), true, stream, false, off ++ ",\"ignore_eos\":true", &.{ "A", "<|end_message|>", "<|message_model|>", "<|content_thinking|>", "Plan." });
++        try t.expectEqual(@as(usize, 2), disabled.committed);
++        try t.expectEqualStrings("A", disabled.got.content.items);
++        try t.expectEqualStrings("", disabled.got.reasoning.items);
++        try t.expect(disabled.request.structure == null);
++    }
++}
++
++test "Inkling Mini off: real tokenizer effort precedence and finite JSON/tool grammars" {
++    const dir_c = std.c.getenv("TF_INKLING_TEST_DIR") orelse return error.SkipZigTest;
++    var arena = std.heap.ArenaAllocator.init(t.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const dir = std.mem.span(dir_c);
++    var problem: []const u8 = "";
++    const hf = try @import("hf_text.zig").HfText.load(a, t.io, dir, null, a, &problem);
++    defer hf.deinit();
++    try t.expect(hf.text().inkling2_mini);
++    var backend: Backend = .{ .tokens = &.{} };
++    const srv = try server.Server.init(t.allocator, t.io, backend.engine(), hf.text(), .{ .served_name = "unrelated-alias", .model_ids = &.{"unrelated-alias"}, .model_dir = dir, .enable_thinking = true }, null);
++    defer srv.deinit();
++    srv.info.structures = true;
++    const msgs = (try json.parse(a, "[{\"role\":\"user\",\"content\":\"Reply briefly.\"}]")).ok;
++    const offered = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"parameters\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}},\"required\":[\"id\"],\"additionalProperties\":false}}}]")).ok.array;
++    var cx: @import("errors.zig").Cx = .{ .a = a, .named_effort = "high" };
++    const high_off = try @import("prompt.zig").renderIds(srv, &cx, msgs, &.{}, false, "high", true);
++    cx.named_effort = "none";
++    const none_off = try @import("prompt.zig").renderIds(srv, &cx, msgs, &.{}, false, "none", true);
++    try t.expectEqualSlices(u32, none_off, high_off);
++    try t.expect(std.mem.endsWith(u32, high_off, &.{ 200001, 200004 }));
++    const high_on = try @import("prompt.zig").renderIds(srv, &cx, msgs, &.{}, true, "high", true);
++    try t.expect(!std.mem.endsWith(u32, high_on, &.{ 200001, 200004 }));
++    const RawGone = struct {
++        pub fn check(_: @This()) bool {
++            return false;
++        }
++    };
++    const raw_fields = (try json.parse(a, "{\"enable_thinking\":false,\"reasoning_effort\":\"high\",\"ignore_eos\":true}")).ok;
++    const raw = try @import("chat.zig").prepare(srv, &cx, .{ .prompt = .{ .ids = &.{1} }, .fields = raw_fields, .max_tokens = 10 }, RawGone{});
++    defer srv.release(raw.preparing, raw.request);
++    try t.expect(raw.stops.ignore_eos);
++    try t.expectEqual(@as(usize, 0), raw.request.eos.len);
++    try t.expectEqualStrings(srv.effortFor("high").?, raw.effort.?);
++    const end = "<|end_message|>";
++    const call = "lookup<|content_invoke_tool_json|>{\"name\":\"lookup\",\"args\":{\"id\":7}}" ++ end;
++    const cases = [_]struct { fields: []const u8, tools: bool, reply: []const u8 }{
++        .{ .fields = "{\"response_format\":{\"type\":\"json_object\"}}", .tools = false, .reply = "{\"answer\":42}" ++ end },
++        .{ .fields = "{\"guided_choice\":[\"yes\",\"no\"]}", .tools = false, .reply = "yes" ++ end },
++        .{ .fields = "{\"tool_call_required\":true}", .tools = true, .reply = call },
++        .{ .fields = "{\"tool_call_required\":true}", .tools = true, .reply = call ++ "<|message_model|>" ++ call },
++        .{ .fields = "{\"tool_call_required\":true,\"tool_call_single\":true}", .tools = true, .reply = call },
++        .{ .fields = "{}", .tools = true, .reply = "<|content_text|>No lookup needed." ++ end },
++        .{ .fields = "{}", .tools = true, .reply = call },
++    };
++    for (cases) |case| {
++        const f = (try json.parse(a, case.fields)).ok;
++        try f.object.put(a, "enable_thinking", .{ .bool = false });
++        cx.template_fields = f;
++        const tools_ = if (case.tools) offered else &.{};
++        const ids = try @import("prompt.zig").renderIds(srv, &cx, msgs, tools_, false, "high", true);
++        try t.expect(std.mem.endsWith(u32, ids, if (case.tools) &.{200001} else &.{ 200001, 200004 }));
++        try f.object.put(a, "reasoning_effort", .{ .string = "high" });
++        try f.object.put(a, "ignore_eos", .{ .bool = true });
++        const Gone = struct {
++            pub fn check(_: @This()) bool {
++                return false;
++            }
++        };
++        // Internal chat callers also need the grammar to begin after the actual Mini prefill.
++        const prepared = try @import("chat.zig").prepare(srv, &cx, .{ .messages = msgs, .tools = tools_, .fields = f, .max_tokens = 100 }, Gone{});
++        defer srv.release(prepared.preparing, prepared.request);
++        try t.expectEqualStrings("none", prepared.effort.?);
++        try t.expect(!prepared.stops.ignore_eos);
++        try t.expectEqual(@as(usize, 0), prepared.request.decode_spans.len);
++        try t.expectEqual(!case.tools, std.mem.indexOfScalar(u32, prepared.request.eos, 200010) != null);
++        const st = prepared.request.structure.?;
++        const matcher = try st.compiler.?.constrained(a, st.compiled.?, null);
++        defer matcher.deinit(a);
++        const reply = try srv.text.encode(a, case.reply, true);
++        const initial = (try matcher.next(a)).?;
++        try t.expect(initial[200008 / 32] & (@as(u32, 1) << (200008 % 32)) == 0);
++        // JSON strings can contain marker spellings as data; this checks the channel choice, not their alphabet.
++        for (reply) |id| try t.expect(try matcher.follow(id));
++        try t.expect(try matcher.follow(200006));
++        try t.expect(matcher.finished());
++    }
++}

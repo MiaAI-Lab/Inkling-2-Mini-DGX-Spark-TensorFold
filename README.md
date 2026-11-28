@@ -14,7 +14,7 @@
 Serve **[Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)** on a single **NVIDIA DGX Spark** (GB10, `sm_121`, 128 GB
 unified memory) through an OpenAI-compatible API (plus a `/v1/messages` Messages-format endpoint). It runs [TensorFold](https://github.com/ashhart/TensorFold)'s Zig engine
 (`tensorfold-native`, Jürgen Schmied's Inkling 2 Mini CUDA engine at [PR #4441](https://github.com/ashhart/TensorFold/pull/4441), commit
-`dc2ca8a1`) plus `patches/0001`–`0030` in NVIDIA's PyTorch container. It has native CUDA vision (`inkling2_vision`: PNG, JPEG, WebP) and
+`dc2ca8a1`) plus the patches in `patches/` in NVIDIA's PyTorch container. It has native CUDA vision (`inkling2_vision`: PNG, JPEG, WebP) and
 structured output and tool calling (`libtfgrammar.so`).
 
 - **Model:** a looped mixture of experts.
@@ -244,7 +244,7 @@ All defaults live in [`scripts/config.sh`](scripts/config.sh). Override them fro
 | `VISION` | `1` | `1`: Inkling 2 vision tower (`--vision`, ~0.59 GiB, PNG/JPEG/WebP); `0`: text only |
 | `VISION_URLS` | `0` | `1`: also fetch http(s) image URLs (`--vision-urls`); `data:` URLs always work |
 | `VISION_MAX_IMAGES` / `VISION_IMAGE_TOKENS` | unset | images a request (engine default 4, up to 100) and an image's token budget (default 4,096) |
-| `THINKING` / `REASONING_EFFORT` | `1` / unset | thinking toggle and an optional default effort (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or `0`–`0.99`) |
+| `THINKING` / `REASONING_EFFORT` | `1` / unset | thinking toggle and an optional default effort (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or `0`–`0.99`); see [thinking-off behavior](docs/thinking-off/README.md) |
 | `TEMPERATURE` / `TOP_P` / `TOP_K` | `1.0` / `1.0` / `0` | default sampling (a request's own values win) |
 | `MAX_TOKENS` | `32768` | reply budget when a request sets none |
 | `PORT` / `HOST` | `8888` / `0.0.0.0` | API listen address |
@@ -270,7 +270,7 @@ All defaults live in [`scripts/config.sh`](scripts/config.sh). Override them fro
 - **Exact serial reference:** `"draft": false` on any request turns drafting off. Drafted replies match `"draft": false` token for token.
 - **Admission:** when all `PARALLEL` slots are full, new requests are rejected rather than queued.
 
-## Patches (`patches/0001`–`0030`)
+## Patches
 
 Applied in order onto TensorFold `dc2ca8a1` (PR #4441) by `scripts/prepare.sh`:
 
